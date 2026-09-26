@@ -105,6 +105,7 @@ kiro                      계정 선택 화면 → 대화
 kiro @NAME [args]         특정 슬롯으로 대화 (이름 또는 `kiro accounts` 의 번호)
 kiro accounts [--refresh] 슬롯 목록 (계정, 크레딧, 상태, 5분 캐시)
 kiro use NAME|auto        우선 슬롯 지정 / 해제
+kiro model [NAME]         기본 모델 보기 / 설정 (WSL, Windows 둘 다)
 kiro login|logout NAME    슬롯 로그인 / 로그아웃
 kiro whoami [NAME]        로그인된 계정 확인
 kiro account add NAME     WSL 로그인 슬롯 추가

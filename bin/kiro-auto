@@ -778,6 +778,7 @@ kiro account commands (slots file: $SLOTS_FILE)
   kiro @NAME [args]         chat on a specific slot (also KIRO_AUTO_FORCE=NAME)
   kiro accounts [--refresh] list slots with account, credits, state (cached up to 5 min)
   kiro use NAME|auto        set / clear the preferred slot
+  kiro model [NAME]         show / set the default model (all installations)
   kiro login|logout NAME    log in / out of one slot (no NAME: choose)
   kiro whoami [NAME]        show logged-in accounts
   kiro account add NAME     add an extra WSL login slot
@@ -853,7 +854,56 @@ has_arg() {
 set_global_model() {
   local slot="$1"
   local model="$2"
-  slot_probe_cmd "$slot" settings --global chat.defaultModel "$model" >/dev/null
+  if [[ "$model" == "__unset__" ]]; then
+    slot_probe_cmd "$slot" settings --global --delete chat.defaultModel >/dev/null
+  else
+    slot_probe_cmd "$slot" settings --global chat.defaultModel "$model" >/dev/null
+  fi
+}
+
+get_global_model() {
+  local out=""
+  local cli=""
+  cli="$(slot_cli "$1")"
+  slot_env_prefix "$1"
+  out="$("${CMD[@]}" "$cli" settings --global chat.defaultModel 2>&1 </dev/null)"
+  if [[ "$out" == *"No value associated"* ]]; then
+    printf '__unset__'
+    return 0
+  fi
+  [[ "$out" == *"("*")"* ]] || return 1
+  out="$(printf '%s\n' "$out" | tr -d '\r' | head -n 1)"
+  out="${out%% (*}"
+  out="${out//[[:space:]]/}"
+  [[ -n "$out" && "$out" != *"notset"* && "$out" != *"Nosetting"* ]] || out="__unset__"
+  printf '%s' "$out"
+}
+
+# `kiro model [NAME]`: show or set the default model of every installation
+# (the Linux CLI is shared by all wsl slots; Windows has its own).
+cmd_model() {
+  local want="${1:-}"
+  local s=""
+  local kind=""
+  local seen=" "
+  for s in "${SLOTS[@]}"; do
+    kind="${SLOT_KIND[$s]}"
+    [[ "$seen" == *" $kind "* ]] && continue
+    seen+="$kind "
+    if [[ "$kind" == windows ]] && ! windows_interop_available; then
+      printf '%-8s (Windows interop unavailable)\n' "$kind"
+      continue
+    fi
+    if [[ -n "$want" ]]; then
+      if set_global_model "$s" "$want"; then
+        printf '%-8s default model -> %s\n' "$kind" "$want"
+      else
+        printf '%-8s could not set %s\n' "$kind" "$want" >&2
+      fi
+    else
+      printf '%-8s default model: %s\n' "$kind" "$(get_global_model "$s" | sed 's/__unset__/(Kiro default)/')"
+    fi
+  done
 }
 
 acquire_model_lock() {
@@ -897,6 +947,9 @@ run_chat() {
     [[ -n "$FLOCK_BIN" ]] || die 73 "flock is required to set the model safely (install util-linux)."
     [[ -n "$DEFAULT_MODEL" ]] || die 2 "KIRO_AUTO_CONFIGURE_MODEL=1 requires KIRO_AUTO_MODEL."
     acquire_model_lock "$slot" || die 73 "Kiro model selection is busy for $slot; refusing a concurrent call."
+    # Remember the user's own default and put it back when this call ends,
+    # so headless calls never change the model interactive chats start with.
+    MODEL_RESTORE="$(get_global_model "$slot")" || MODEL_RESTORE=""
     set_global_model "$slot" "$DEFAULT_MODEL" || die 74 "Kiro model selection failed for $slot ($DEFAULT_MODEL)."
   fi
   # Last-moment identity check: the account may have changed (login/logout
@@ -928,6 +981,21 @@ run_chat() {
     else
       unset XDG_DATA_HOME
     fi
+  fi
+  if [[ -n "${MODEL_RESTORE:-}" && "$MODEL_RESTORE" != "$DEFAULT_MODEL" ]]; then
+    # Run as a child (lock still held via fd 9), then restore the default -
+    # unless someone changed it meanwhile.
+    local restore_slot="$slot" restore_to="$MODEL_RESTORE" set_to="$DEFAULT_MODEL"
+    restore_model() {
+      [[ "$(get_global_model "$restore_slot")" == "$set_to" ]] &&
+        set_global_model "$restore_slot" "$restore_to"
+    }
+    trap 'restore_model; exit 130' INT TERM HUP
+    "$cli" "${PRE_ARGS[@]}" "$SUBCMD" "${default_args[@]}" "$@"
+    local rc=$?
+    trap - INT TERM HUP
+    restore_model
+    exit "$rc"
   fi
   exec "$cli" "${PRE_ARGS[@]}" "$SUBCMD" "${default_args[@]}" "$@"
 }
@@ -1076,6 +1144,11 @@ case "${1:-}" in
   --status | status | accounts | ls)
     [[ "${2:-}" == --refresh || "${2:-}" == -r ]] && CACHE_BYPASS=1
     cmd_status
+    exit 0
+    ;;
+  model)
+    shift
+    cmd_model "$@"
     exit 0
     ;;
   use)

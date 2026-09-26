@@ -42,7 +42,14 @@ case "$1" in
     [[ -t 0 ]] || echo "STDIN:$(cat)"
     echo "chat-diagnostic" >&2
     exit "$(cat "$data/chat_rc" 2>/dev/null || echo 0)" ;;
-  settings) echo "settings $*" >>"$data/settings.log"; echo "fake settings $*" ;;
+  settings)
+    echo "settings $*" >>"$data/settings.log"
+    mf="$HOME/.local/share/kiro-cli/model"
+    if [[ "$*" == *--delete* ]]; then rm -f "$mf"
+    elif [[ "$*" == *"chat.defaultModel "* ]]; then echo "${@: -1}" >"$mf"
+    elif [[ "$*" == *chat.defaultModel ]]; then if [[ -f "$mf" ]]; then echo "$(cat "$mf") (global)"; else echo "error: No value associated with chat.defaultModel"; exit 1; fi
+    fi
+    echo "fake settings $*" ;;
   *) echo "fake $*" ;;
 esac
 EOF
@@ -275,6 +282,16 @@ check "delegate set model via settings" "chat.defaultModel m2" "$(cat "$HOME/.lo
 echo 7 >"$HOME/.local/share/kiro-cli/chat_rc"
 KIRO_AUTO_BIN="$auto" "$root/bin/kiro-delegate" --model m2 --no-tools --prompt hi >/dev/null 2>&1; rc=$?
 check "delegate keeps Kiro's exit code" "7" "$rc"
+echo "my-model" >"$HOME/.local/share/kiro-cli/model"
+KIRO_AUTO_BIN="$auto" "$root/bin/kiro-delegate" --model m3 --no-tools --prompt hi >/dev/null 2>&1
+check "delegate restores the user's default model" "my-model" "$(cat "$HOME/.local/share/kiro-cli/model")"
+check "delegate did set its own model first" "chat.defaultModel m3" "$(cat "$HOME/.local/share/kiro-cli/settings.log")"
+rm -f "$HOME/.local/share/kiro-cli/model"
+KIRO_AUTO_BIN="$auto" "$root/bin/kiro-delegate" --model m3 --no-tools --prompt hi >/dev/null 2>&1
+check "delegate restores 'no default' too" "unset" "$([[ -e "$HOME/.local/share/kiro-cli/model" ]] && cat "$HOME/.local/share/kiro-cli/model" || echo unset)"
+check "kiro model sets the default" "default model -> m9" "$("$auto" model m9 </dev/null 2>&1)"
+check "kiro model shows the default" "default model: m9" "$("$auto" model </dev/null 2>&1)"
+rm -f "$HOME/.local/share/kiro-cli/model"
 check "delegate sends the prompt on stdin" "STDIN:hi" "$(cat "$work/d.out")"
 check "delegate keeps the prompt out of argv" "clean" "$(grep -q -- '-- hi' "$work/d.out" && echo dirty || echo clean)"
 rm -f "$HOME/.local/share/kiro-cli/chat_rc"

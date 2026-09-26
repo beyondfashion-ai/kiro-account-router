@@ -147,6 +147,7 @@ kiro                      interactive account picker, then chat
 kiro @NAME [args]         chat on a specific slot (NAME or the number shown by `kiro accounts`)
 kiro accounts [--refresh] list slots with account, credits, state
 kiro use NAME|auto        set / clear the preferred slot
+kiro model [NAME]         show / set the default model (Linux and Windows installs)
 kiro login|logout NAME    log in / out of one slot (no NAME: choose on a terminal;
                           inside a routed chat: that chat's slot; otherwise required)
 kiro whoami [NAME]        show logged-in accounts
@@ -181,8 +182,9 @@ printf '%s' 'Reply only: OK' | kiro-delegate --model MODEL --no-tools
 
 `kiro-delegate` sets the model via the selected installation's
 `chat.defaultModel` (under an `flock` lock) instead of `--model`, because some
-Kiro CLI releases ignore `--model` in headless mode. Because the setting is
-global per installation, it changes the default model for that installation.
+Kiro CLI releases ignore `--model` in headless mode. The previous default is
+put back when the call ends, so your interactive chats keep starting with the
+model you chose (`kiro model NAME`).
 
 ## Configuration
 

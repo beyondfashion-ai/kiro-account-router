@@ -2,6 +2,14 @@
 
 All notable changes are listed here. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] - 2026-09-27
+
+- `kiro-delegate` no longer leaves its model as your default: the previous
+  `chat.defaultModel` is restored when the call ends (unless you changed it
+  meanwhile).
+- New `kiro model [NAME]` shows or sets the default model on the Linux and
+  Windows installations at once.
+
 ## [0.2.0] - 2026-09-26
 
 Faster starts.
@@ -31,5 +39,6 @@ First public release.
   preserved, model set under a lock.
 - Offline test suite and CI (shellcheck + tests).
 
+[0.2.1]: https://github.com/beyondfashion-ai/kiro-account-router/releases/tag/v0.2.1
 [0.2.0]: https://github.com/beyondfashion-ai/kiro-account-router/releases/tag/v0.2.0
 [0.1.0]: https://github.com/beyondfashion-ai/kiro-account-router/releases/tag/v0.1.0

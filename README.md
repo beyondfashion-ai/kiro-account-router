@@ -145,7 +145,7 @@ the real binary back.
 ```text
 kiro                      interactive account picker, then chat
 kiro @NAME [args]         chat on a specific slot (NAME or the number shown by `kiro accounts`)
-kiro accounts             list slots with account, credits, state
+kiro accounts [--refresh] list slots with account, credits, state
 kiro use NAME|auto        set / clear the preferred slot
 kiro login|logout NAME    log in / out of one slot (no NAME: choose on a terminal;
                           inside a routed chat: that chat's slot; otherwise required)
@@ -204,6 +204,7 @@ Set `pin_email` to an address to refuse any other account in that slot.
 | `KIRO_AUTO_PREFER=NAME` | try this slot first (same as `kiro use`) |
 | `KIRO_AUTO_PICKER=0` | skip the interactive picker |
 | `KIRO_AUTO_PICKER_TIMEOUT=30` | seconds before the picker auto-selects (counted after the checks finish) |
+| `KIRO_AUTO_CACHE_TTL=300` | seconds a usage check is reused (`0` = always check) |
 | `KIRO_AUTO_PROBE_DEADLINE=45` | max seconds for one round of account checks; slots not done by then are `unknown` |
 | `KIRO_AUTO_MODEL` | default `--model` for chats (unset = Kiro's own default) |
 | `KIRO_AUTO_AGENT` / `KIRO_AUTO_TRUST_ALL=1` | default `--agent` / `--trust-all-tools` for interactive chats |
@@ -226,6 +227,16 @@ slot unavailable, `73`/`74` model lock or model setting failed.
 - `kiro update` runs under the same lock as install/uninstall. If the update
   fails, the known-good binary stays active; if the shim cannot be restored,
   the command exits `70`.
+
+## Speed
+
+A full check (identity + `/usage` for every slot, in parallel) takes about 5 s.
+Its result is cached per slot for `KIRO_AUTO_CACHE_TTL` seconds (default 300).
+Within that window a chat starts right away on the preferred slot if it had
+credits; only the identity check before the chat runs again (about 1-2 s).
+`kiro accounts --refresh` or `r` in the picker forces a new check, and
+login/logout clears that slot's cache. A cached result can be up to 5 minutes
+old, so a slot that ran out in the meantime is noticed at the next check.
 
 ## How usage is read
 
@@ -257,12 +268,18 @@ make no network calls.
   then refuses to start. `kiro-delegate` forces `--agent-engine v2`.
 - Tested with Kiro CLI 2.18.1 (Linux) and 2.24.1 (Windows); other versions
   are untested.
-- Checking usage opens a short Kiro TUI session per slot, in parallel (usually
-  10-20 s, capped by `KIRO_AUTO_PROBE_DEADLINE`).
+- Checking usage opens a short Kiro TUI session per slot, in parallel (about
+  5 s, capped by `KIRO_AUTO_PROBE_DEADLINE`). Results are reused for 5 minutes,
+  so most starts only pay for the ~2 s identity check.
 - Raw `kiro-cli chat --model X` calls are passed through unchanged; whether
   `--model` is honored depends on the Kiro CLI release.
 - While `kiro update` runs, the updater may briefly put the new binary at
   `kiro-cli`; a direct `kiro-cli` call at that exact moment bypasses routing.
+- Kiro does not show the account inside the `/usage` panel, so usage is bound
+  to an account by checking `whoami` before and after it, and again right before
+  the chat. A login that changes and changes back within those few seconds, or
+  changes in the instant between the last check and the chat start, is not
+  detected.
 - The shim recognizes its own files by a marker string; do not copy that
   marker into unrelated scripts at the same paths.
 

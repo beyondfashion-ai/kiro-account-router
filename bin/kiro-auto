@@ -86,7 +86,7 @@ FLOCK_BIN="$(type -P flock || true)"
 
 declare -a SLOTS=()
 declare -A SLOT_KIND=() SLOT_DATA=() SLOT_PIN=()
-declare -A P_STATE=() P_EMAIL=() P_USED=() P_LIMIT=()
+declare -A P_STATE=() P_EMAIL=() P_USED=() P_LIMIT=() P_CACHED=()
 declare -a CMD=()
 
 # ---------------------------------------------------------------- utilities
@@ -484,7 +484,15 @@ probe_slot() {
   local used=""
   local limit=""
   local state="unknown"
+  # Sequential on purpose: whoami first, then /usage. If the login changes
+  # during /usage, the recorded email no longer matches and the identity
+  # check before the chat refuses to start (and drops the cache entry).
   if usage="$(slot_usage_text "$slot")"; then
+    # Bind the numbers to the account: the login must be unchanged after
+    # /usage, otherwise the result is unknown (and not cached).
+    local after=""
+    after="$(slot_probe_cmd "$slot" whoami | tr -d '\r' | sed -n 's/^Email: //p' | head -n 1)"
+    [[ "${after,,}" == "${email,,}" ]] || usage=""
     read -r used limit <<<"$(printf '%s\n' "$usage" | usage_numbers)"
     if [[ -n "$used" && -n "$limit" ]]; then
       if awk -v u="$used" -v l="$limit" 'BEGIN { exit !(u >= l) }'; then
@@ -497,10 +505,83 @@ probe_slot() {
   printf '%s\t%s\t%s\t%s\n' "$state" "$email" "${used:--}" "${limit:--}"
 }
 
+# ---- probe cache: skip the slow /usage check when a slot was checked
+# recently. Only the identity check (whoami) runs again before a chat.
+CACHE_DIR="$STATE_ROOT/cache"
+CACHE_TTL="${KIRO_AUTO_CACHE_TTL:-300}"
+[[ "$CACHE_TTL" =~ ^[0-9]+$ ]] || CACHE_TTL=300
+CACHE_BYPASS=0
+
+cache_read() {
+  local slot="$1"
+  local file="$CACHE_DIR/$slot"
+  ((CACHE_TTL > 0 && CACHE_BYPASS == 0)) || return 1
+  [[ -f "$file" && ! -L "$file" ]] || return 1
+  # The cache is untrusted: any malformed record is a miss (full probe).
+  local ts state email used limit extra now
+  IFS=$'\t' read -r ts state email used limit extra <"$file" || return 1
+  [[ -z "$extra" && "$ts" =~ ^[0-9]+$ ]] || return 1
+  [[ "$email" == *@* && "$email" != *[[:space:]]* ]] || return 1
+  [[ "$used" =~ ^[0-9]+([.][0-9]+)?$ && "$limit" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+  now="$(date +%s)"
+  ((ts <= now && now - ts < CACHE_TTL)) || return 1
+  local actual="available"
+  awk -v u="$used" -v l="$limit" 'BEGIN { exit !(u >= l) }' && actual="full"
+  [[ "$state" == "$actual" ]] || return 1
+  local pin="${SLOT_PIN[$slot]:--}"
+  [[ "$pin" == "-" || "${email,,}" == "${pin,,}" ]] || return 1
+  P_STATE[$slot]="$state"
+  P_EMAIL[$slot]="$email"
+  P_USED[$slot]="$used"
+  P_LIMIT[$slot]="$limit"
+  P_CACHED[$slot]="$((now - ts))"
+}
+
+cache_write() {
+  local slot="$1"
+  ((CACHE_TTL > 0)) || return 0
+  case "${P_STATE[$slot]:-}" in
+    available | full) ;;
+    *)
+      rm -f "$CACHE_DIR/$slot"
+      return 0
+      ;;
+  esac
+  private_dir "$CACHE_DIR" 2>/dev/null || return 0
+  local tmp=""
+  tmp="$(mktemp "$CACHE_DIR/.$slot.XXXXXX")" || return 0
+  printf '%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "${P_STATE[$slot]}" "${P_EMAIL[$slot]}" \
+    "${P_USED[$slot]}" "${P_LIMIT[$slot]}" >"$tmp" && mv -f "$tmp" "$CACHE_DIR/$slot"
+}
+
+cache_clear() {
+  if (($#)); then
+    local s=""
+    for s in "$@"; do rm -f "$CACHE_DIR/$s"; done
+  else
+    rm -f "$CACHE_DIR"/* 2>/dev/null
+  fi
+  return 0
+}
+
+# Fill P_* from cache where fresh; probe only the rest (full mode).
+probe_all_cached() {
+  local need=()
+  local s=""
+  for s in "$@"; do
+    cache_read "$s" || need+=("$s")
+  done
+  ((${#need[@]})) || return 0
+  probe_all full "${need[@]}"
+  for s in "${need[@]}"; do cache_write "$s"; done
+}
+
 # Probe slots in parallel and fill P_* arrays.
 probe_all() {
   local mode="$1"
   shift
+  local s0=""
+  for s0 in "$@"; do unset "P_CACHED[$s0]"; done
   local tmp=""
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/kiro-auto.XXXXXX")" || die 73 "cannot create a temporary directory"
   # One overall deadline per probe wave. timeout signals the probe's whole
@@ -564,8 +645,10 @@ print_table() {
     [[ "$s" == "$auto" ]] && mark="*"
     credits="-"
     [[ "${P_USED[$s]:--}" != "-" ]] && credits="${P_USED[$s]}/${P_LIMIT[$s]}"
-    printf '%s %d) %-22s %-34s %-16s %s\n' "$mark" "$i" "$(slot_label "$s")" \
-      "${P_EMAIL[$s]:--}" "$credits" "${P_STATE[$s]:-unknown}"
+    local age=""
+    [[ -n "${P_CACHED[$s]:-}" ]] && age=" (checked ${P_CACHED[$s]}s ago)"
+    printf '%s %d) %-22s %-34s %-16s %s%s\n' "$mark" "$i" "$(slot_label "$s")" \
+      "${P_EMAIL[$s]:--}" "$credits" "${P_STATE[$s]:-unknown}" "$age"
   done
 }
 
@@ -574,6 +657,7 @@ print_table() {
 slot_exec_admin() {
   local slot="$1"
   shift
+  case "${1:-}" in login | logout) cache_clear "$slot" ;; esac
   if [[ "${SLOT_KIND[$slot]}" == "windows" ]]; then
     windows_interop_available || die 125 "Windows slot unavailable: WSL↔Windows interop is inactive"
   fi
@@ -586,6 +670,7 @@ slot_exec_admin() {
 slot_run_admin() {
   local slot="$1"
   shift
+  case "${1:-}" in login | logout) cache_clear "$slot" ;; esac
   if [[ "${SLOT_KIND[$slot]}" == "windows" ]]; then
     windows_interop_available || {
       printf 'Windows slot unavailable: WSL↔Windows interop is inactive\n' >&2
@@ -639,6 +724,7 @@ account_rm() {
   lock_config
   name="$(resolve_slot "${1:-}")" || die 2 "unknown slot: ${1:-}"
   ((${#SLOTS[@]} > 1)) || die 2 "refusing to remove the last slot"
+  cache_clear "$name"
   local tmp=""
   tmp="$(mktemp "$CONFIG_DIR/.slots.XXXXXX")" || die 73 "cannot create a temporary file in $CONFIG_DIR"
   if ! awk -v n="$name" '($1 == n) { next } { print }' "$SLOTS_FILE" >"$tmp" ||
@@ -674,7 +760,7 @@ cmd_use() {
 cmd_status() {
   local order=()
   mapfile -t order < <(ordered_slots)
-  probe_all full "${order[@]}"
+  probe_all_cached "${order[@]}"
   local auto=""
   auto="$(auto_pick "${order[@]}" || true)"
   print_table "$auto" "${order[@]}"
@@ -690,7 +776,7 @@ account_help() {
 kiro account commands (slots file: $SLOTS_FILE)
   kiro                      interactive account picker, then chat
   kiro @NAME [args]         chat on a specific slot (also KIRO_AUTO_FORCE=NAME)
-  kiro accounts             list slots with account, credits, state
+  kiro accounts [--refresh] list slots with account, credits, state (cached up to 5 min)
   kiro use NAME|auto        set / clear the preferred slot
   kiro login|logout NAME    log in / out of one slot (no NAME: choose)
   kiro whoami [NAME]        show logged-in accounts
@@ -820,12 +906,15 @@ run_chat() {
   local expected="${P_EMAIL[$slot]:--}"
   local now=""
   now="$(slot_probe_cmd "$slot" whoami | tr -d '\r' | sed -n 's/^Email: //p' | head -n 1)"
-  [[ -n "$now" ]] || die 78 "slot $slot: could not verify the logged-in account; not starting"
+  # Any failed check drops the slot's cached result so it is re-probed.
+  [[ -n "$now" ]] || { cache_clear "$slot"; die 78 "slot $slot: could not verify the logged-in account; not starting"; }
   local pin="${SLOT_PIN[$slot]}"
   if [[ "$pin" != "-" && "${now,,}" != "${pin,,}" ]]; then
+    cache_clear "$slot"
     die 78 "slot $slot is pinned to $pin but $now is logged in; not starting"
   fi
   if [[ "$expected" != "-" && "${now,,}" != "${expected,,}" ]]; then
+    cache_clear "$slot"
     die 78 "slot $slot account changed since it was checked (${expected} -> ${now}); run again"
   fi
   # Informational for child processes; selector-only knobs must not leak into
@@ -855,9 +944,10 @@ interactive_picker() {
     mapfile -t order < <(ordered_slots)
     if ((refresh)); then
       printf 'Checking Kiro accounts...\n' >&2
-      probe_all full "${order[@]}"
+      probe_all_cached "${order[@]}"
     fi
     refresh=1
+    CACHE_BYPASS=0
     auto="$(auto_pick "${order[@]}" || true)"
     print_table "$auto" "${order[@]}" >&2
     if [[ -n "$auto" ]]; then
@@ -881,7 +971,7 @@ interactive_picker() {
         refresh=0
         ;;
       q | Q) exit 0 ;;
-      r | R) ;;
+      r | R) CACHE_BYPASS=1 ;;
       a | A)
         local new_name=""
         read -r -p 'New slot name (e.g. second): ' new_name </dev/tty || true
@@ -984,6 +1074,7 @@ case "${1:-}" in
     exit 0
     ;;
   --status | status | accounts | ls)
+    [[ "${2:-}" == --refresh || "${2:-}" == -r ]] && CACHE_BYPASS=1
     cmd_status
     exit 0
     ;;
@@ -1061,8 +1152,15 @@ if is_tty && [[ "$SUBCMD" == chat && "${KIRO_AUTO_PICKER:-1}" == "1" && "${KIRO_
 fi
 
 mapfile -t order < <(ordered_slots)
-probe_all full "${order[@]}"
-chosen="$(auto_pick "${order[@]}" || true)"
+# Fast path: the preferred slot was verified recently -> no probing at all
+# (run_chat still verifies the account right before starting).
+chosen=""
+if cache_read "${order[0]}" && [[ "${P_STATE[${order[0]}]}" == available ]]; then
+  chosen="${order[0]}"
+else
+  probe_all_cached "${order[@]}"
+  chosen="$(auto_pick "${order[@]}" || true)"
+fi
 if [[ -n "$chosen" ]]; then
   for s in "${order[@]}"; do
     [[ "$s" == "$chosen" ]] && break

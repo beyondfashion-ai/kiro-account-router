@@ -63,6 +63,8 @@ flowchart LR
 - **비대화형 래퍼** `kiro-delegate`: stdout에는 모델 답변만, 프롬프트는 stdin으로, Kiro 종료코드 유지
 - **안전 우선**: 크레딧을 확인할 수 없으면 추측하지 않고 시작하지 않음. 시작 직전 계정을 다시 확인
 - **재전송 없음**: 이미 시작된 대화는 절대 다른 계정으로 다시 보내지 않음
+- **빠른 시작**: 확인 결과를 5분간 재사용해서, 보통은 계정 확인(1~2초)만 하고 바로 시작
+  (`kiro-auto accounts --refresh` 로 강제 재확인)
 - **순수 bash**: 런타임 불필요, 오프라인 테스트 100개 이상을 CI에서 실행
 
 ## 설치
@@ -101,7 +103,7 @@ kiro() { command "$HOME/.local/bin/kiro-auto" "$@"; }
 ```text
 kiro                      계정 선택 화면 → 대화
 kiro @NAME [args]         특정 슬롯으로 대화 (이름 또는 `kiro accounts` 의 번호)
-kiro accounts             슬롯 목록 (계정, 크레딧, 상태)
+kiro accounts [--refresh] 슬롯 목록 (계정, 크레딧, 상태, 5분 캐시)
 kiro use NAME|auto        우선 슬롯 지정 / 해제
 kiro login|logout NAME    슬롯 로그인 / 로그아웃
 kiro whoami [NAME]        로그인된 계정 확인

@@ -13,6 +13,7 @@ export HOME="$work/home"
 mkdir -p "$HOME/.local/bin" "$HOME/.local/share/kiro-cli"
 export KIRO_AUTO_CONFIG_DIR="$work/config"
 export KIRO_AUTO_SHIM=0
+export KIRO_AUTO_CACHE_TTL=0 # most tests change state between calls; cache tested below
 export KIRO_AUTO_WINDOWS_CLI="$work/none.exe" # windows kind stays unavailable
 unset XDG_DATA_HOME KIRO_AUTO_PREFER KIRO_AUTO_FORCE KIRO_AUTO_SLOT KIRO_AUTO_WSL_CLI \
   KIRO_AUTO_MODEL KIRO_AUTO_AGENT KIRO_AUTO_TRUST_ALL KIRO_AUTO_DIAGNOSTICS KIRO_AUTO_CONFIGURE_MODEL
@@ -365,6 +366,73 @@ shim_list="$(sed -n 's/^PASSTHROUGH=" \(.*\) "$/\1/p' "$root/bin/kiro-cli-shim" 
 auto_list="$(grep -A1 '^  debug | settings' "$auto" | head -1 | tr -d ')' | tr '|' '\n' | tr -d ' ' | grep . | sort | tr '\n' ' ')"
 check "passthrough lists match" "same" "$([[ "$shim_list" == "$auto_list" ]] && echo same || echo "diff: [$shim_list] vs [$auto_list]")"
 check "passthrough list not empty" "settings" "$shim_list"
+
+# --- probe cache: a fresh result skips /usage; login/logout and --refresh clear it.
+cat >"$work/count-usage" <<'EOF'
+#!/usr/bin/env bash
+echo x >>"$HOME/usage.calls"
+exec "$REAL_USAGE" "$@"
+EOF
+chmod 755 "$work/count-usage"
+rm -f "$HOME/usage.calls" "$HOME/.local/share/kiro-auto/cache/"*
+echo "10 100" >"$HOME/.local/share/kiro-cli/credits"
+cached_run() { KIRO_AUTO_CACHE_TTL=300 REAL_USAGE="$work/fake-usage" KIRO_AUTO_USAGE_BIN="$work/count-usage" "$auto" "$@" </dev/null 2>&1; }
+cached_run accounts >/dev/null
+calls1="$(wc -l <"$HOME/usage.calls")"
+out="$(cached_run accounts)"
+check "second listing uses the cache" "$calls1" "$(wc -l <"$HOME/usage.calls")"
+check "cached rows are labelled" "checked" "$out"
+out="$(KIRO_AUTO_DRY_RUN=1 cached_run chat --no-interactive -- hi)"
+check "cached fast path starts the chat" "Using: wsl" "$out"
+check "fast path runs no /usage" "$calls1" "$(wc -l <"$HOME/usage.calls")"
+cached_run accounts --refresh >/dev/null
+check "--refresh re-checks" "yes" "$( (($(wc -l <"$HOME/usage.calls") > calls1)) && echo yes)"
+echo "b@example.com" >"$HOME/.local/share/kiro-cli/email"
+check "cached account change still refused before chat" "account changed" "$(cached_run chat --no-interactive -- hi)"
+echo "a@example.com" >"$HOME/.local/share/kiro-cli/email"
+KIRO_AUTO_WSL_CLI="$work/fake-cli" cached_run logout wsl >/dev/null
+check "logout clears that slot's cache" "gone" "$([[ -e "$HOME/.local/share/kiro-auto/cache/wsl" ]] || echo gone)"
+rm -f "$HOME/usage.calls" "$HOME/.local/share/kiro-auto/cache/"*
+
+# Malformed cache records are ignored (full probe instead).
+mkdir -p "$HOME/.local/share/kiro-auto/cache"
+now="$(date +%s)"
+for rec in "$now\tavailable" "$now\tavailable\ta@example.com\t1\t100\textra" \
+  "$now\tavailable\ta@example.com\tx\t100" "$now\tavailable\ta@example.com\t100\t100" \
+  "$((now + 999))\tavailable\ta@example.com\t1\t100" "$now\tavailable\t-\t1\t100"; do
+  printf "$rec\n" >"$HOME/.local/share/kiro-auto/cache/wsl"
+  rm -f "$HOME/usage.calls"
+  cached_run accounts >/dev/null
+  check "malformed cache ignored: $(printf "$rec" | cut -f2- | tr '\t' ' ')" "x" "$(head -1 "$HOME/usage.calls" 2>/dev/null)"
+done
+rm -f "$HOME/usage.calls" "$HOME/.local/share/kiro-auto/cache/"*
+
+# Login switched during /usage: the chat is refused, never run on the new account.
+cat >"$work/switch-usage" <<'EOF'
+#!/usr/bin/env bash
+echo "b@example.com" >"$HOME/.local/share/kiro-cli/email"
+echo "Estimated Usage"
+echo "Credits (10 of 100 covered in plan)"
+EOF
+chmod 755 "$work/switch-usage"
+echo "a@example.com" >"$HOME/.local/share/kiro-cli/email"
+out="$(KIRO_AUTO_USAGE_BIN="$work/switch-usage" KIRO_AUTO_CACHE_TTL=300 "$auto" chat --no-interactive -- hi </dev/null 2>&1)"
+check "login switch during /usage is refused" "never guessed" "$out"
+check "switched result not left in cache" "gone" "$([[ -e "$HOME/.local/share/kiro-auto/cache/wsl" ]] || echo gone)"
+echo "a@example.com" >"$HOME/.local/share/kiro-cli/email"
+# Switch during /usage and back again: the mixed result is never cached/used.
+out="$(KIRO_AUTO_USAGE_BIN="$work/switch-usage" KIRO_AUTO_CACHE_TTL=300 "$auto" accounts </dev/null 2>&1)"
+check "switch during /usage makes usage unknown" "unknown" "$(grep ' wsl (wsl)' <<<"$out")"
+check "switch during /usage is not cached" "gone" "$([[ -e "$HOME/.local/share/kiro-auto/cache/wsl" ]] || echo gone)"
+echo "a@example.com" >"$HOME/.local/share/kiro-cli/email"
+# Pin mismatch before a chat drops the cache entry.
+awk '$1=="wsl"{$4="a@example.com"}1' "$KIRO_AUTO_CONFIG_DIR/slots" >"$work/s" && mv "$work/s" "$KIRO_AUTO_CONFIG_DIR/slots"
+printf '%s\tavailable\ta@example.com\t1\t100\n' "$(date +%s)" >"$HOME/.local/share/kiro-auto/cache/wsl"
+echo "b@example.com" >"$HOME/.local/share/kiro-cli/email"
+KIRO_AUTO_CACHE_TTL=300 "$auto" chat --no-interactive -- hi </dev/null >/dev/null 2>&1
+check "pin mismatch before chat clears cache" "gone" "$([[ -e "$HOME/.local/share/kiro-auto/cache/wsl" ]] || echo gone)"
+awk '$1=="wsl"{$4="-"}1' "$KIRO_AUTO_CONFIG_DIR/slots" >"$work/s" && mv "$work/s" "$KIRO_AUTO_CONFIG_DIR/slots"
+echo "a@example.com" >"$HOME/.local/share/kiro-cli/email"
 
 # --- account change between the check and the chat is refused.
 cat >"$work/flipcli" <<'EOF'

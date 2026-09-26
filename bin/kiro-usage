@@ -79,14 +79,15 @@ capture_pane() {
 }
 
 ready=0
-for _ in $(seq 1 25); do
+# Poll every 0.2 s (25 s budget) so a ready prompt is noticed right away.
+for _ in $(seq 1 125); do
   pane="$(capture_pane)"
   if [[ "$pane" == *"ask a question or describe a task"* ]]; then
     ready=1
     break
   fi
   "$tmux_bin" has-session -t "$session" 2>/dev/null || break
-  sleep 1
+  sleep 0.2
 done
 if ((ready == 0)); then
   printf 'kiro-usage: Kiro prompt did not become ready\n' >&2
@@ -96,14 +97,14 @@ fi
 "$tmux_bin" send-keys -t "$session" -l -- '/usage'
 "$tmux_bin" send-keys -t "$session" Enter
 
-for _ in $(seq 1 15); do
+for _ in $(seq 1 75); do
   pane="$(capture_pane)"
   if [[ "$pane" == *"Estimated Usage"* && "$pane" == *"Credits ("* ]]; then
     printf '%s\n' "$pane"
     exit 0
   fi
   "$tmux_bin" has-session -t "$session" 2>/dev/null || break
-  sleep 1
+  sleep 0.2
 done
 
 printf 'kiro-usage: /usage did not return a readable usage panel\n' >&2

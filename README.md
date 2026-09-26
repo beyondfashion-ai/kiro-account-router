@@ -1,41 +1,97 @@
+<div align="center">
+
 # kiro-account-router
 
-Usage-aware account routing for [Kiro CLI](https://kiro.dev/cli/) when you have
-more than one Kiro account (for example a work and a personal account, each
-with its own included credits) on a WSL machine.
+**Use every Kiro account you have, without logging in and out.**
 
-Kiro CLI keeps one login per installation. This tool treats each place a login
-can live as a **slot** and, before each chat, picks a slot whose account still
-has included credits:
+Usage-aware account routing for [Kiro CLI](https://kiro.dev/cli/) on Linux / WSL.
+Each chat starts on a logged-in account that still has credits.
+
+[![CI](https://github.com/beyondfashion-ai/kiro-account-router/actions/workflows/ci.yml/badge.svg)](https://github.com/beyondfashion-ai/kiro-account-router/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Shell: bash 4+](https://img.shields.io/badge/shell-bash%204%2B-4EAA25?logo=gnubash&logoColor=white)
+![Platform: Linux | WSL2](https://img.shields.io/badge/platform-Linux%20%7C%20WSL2-lightgrey)
+![Pure bash](https://img.shields.io/badge/pure-bash-success)
+
+English · [한국어](README.ko.md)
+
+</div>
+
+---
+
+```text
+$ kiro-auto accounts
+* 1) wsl (wsl)              alice@example.com       115.96/5000      available
+  2) windows (windows)      bob@example.com         864.80/2000      available
+  3) second (wsl, extra)    carol@example.com       2000/2000        full
+* = auto choice
+
+$ kiro-auto
+Enter=wsl (auto, chosen after 30s)  N=use slot  lN=login  oN=logout  a=add account  r=refresh  q=quit
+> 
+Kiro account: alice@example.com [wsl (wsl)]
+```
+
+## Why
+
+Kiro CLI keeps **one login per installation**. If you have several accounts
+(say a work account and a personal one, each with its own included credits),
+you end up running `logout` / `login` whenever one runs dry, and every other
+tool that calls `kiro-cli` (Codex, Claude Code, scripts) keeps hitting the
+exhausted one.
+
+kiro-account-router treats each place a login can live as a **slot**, checks
+all slots before a chat starts, and picks the first one that still has
+credits. No hardcoded accounts, no replayed prompts.
+
+## How it works
+
+```mermaid
+flowchart LR
+    A["kiro-auto / kiro<br/>kiro-delegate<br/>kiro-cli chat (with --shim)"] --> B{"check all slots<br/>in parallel<br/>whoami + /usage"}
+    B -->|first slot with credits| C["re-check identity<br/>right before start"]
+    C --> D["Kiro chat on that account"]
+    B -->|none verified| E["refuse to start<br/>(exit 69 / 75)"]
+```
 
 | Slot kind | Where the login lives |
 |---|---|
 | `wsl` | the Linux Kiro CLI (default data dir, or an extra `XDG_DATA_HOME` dir per slot) |
 | `windows` | the Windows Kiro CLI (`kiro-cli.exe`), called through WSL interop |
 
-Accounts are not hardcoded. Whatever account is logged in to a slot is used,
-unless you pin a slot to one email.
+Whatever account is logged in to a slot is used, unless you pin a slot to one
+email.
 
 ## Features
 
 - **Automatic selection**: slots are checked in parallel (`whoami` + `/usage`);
   the first slot in preference order with remaining credits is used.
-- **Works for other tools too** (opt-in, `./install.sh --shim`): a shim at `~/.local/bin/kiro-cli`
-  routes every model-using call from other agents (Codex, Claude Code,
-  scripts) through the selector with their flags unchanged: `kiro-cli chat`,
-  implicit chats (`kiro-cli`, `kiro-cli --resume`, `kiro-cli --agent X`),
-  `translate`, and `acp`. Other subcommands go straight to the real CLI.
-- **Interactive picker**: running `kiro-auto` (or `kiro`, see below) in a terminal shows every slot with
-  its account and credits. Press Enter (or wait 30 s) for the auto choice, or
-  pick, log in, log out, or add an account right there.
-- **Extra accounts**: `kiro-auto account add second` creates a new WSL login slot
-  without touching your existing login.
+- **Interactive picker**: running `kiro-auto` in a terminal shows every slot
+  with its account and credits. Press Enter (or wait 30 s) for the auto choice,
+  or pick, log in, log out, or add an account right there.
+- **More accounts, no juggling**: `kiro-auto account add second` creates a new
+  WSL login slot next to your existing login.
+- **Works for other tools too** (opt-in, `./install.sh --shim`): a shim at
+  `~/.local/bin/kiro-cli` routes every model-using call from other agents
+  through the selector with their flags unchanged: `kiro-cli chat`, implicit
+  chats (`kiro-cli`, `kiro-cli --resume`, `kiro-cli --agent X`), `translate`,
+  and `acp`. Other subcommands go straight to the real CLI.
+- **Headless wrapper**: `kiro-delegate` gives other agents clean stdout, the
+  prompt on stdin, and Kiro's exit code.
 - **Fails closed**: automatic selection never guesses. If no slot's remaining
   credits can be verified, nothing is started. (An explicit choice, `kiro @NAME`
-  or picking a slot by number, is honored even when its usage is unknown.)
+  or picking a slot by number, is honored even when its usage is unknown; the
+  account itself is always verified.)
 - **No replay**: selection happens only before a chat starts. A chat that has
   started is never re-sent to another account, so output and tool actions are
   never duplicated.
+- **Plain bash**: no runtime, no package manager; 100+ offline tests in CI.
+
+## Contents
+
+- [Requirements](#requirements) · [Install](#install) · [Usage](#usage) ·
+  [Configuration](#configuration) · [Safety checks](#safety-checks) ·
+  [Known limitations](#known-limitations) · [Tests](#tests)
 
 ## Requirements
 
@@ -218,8 +274,10 @@ change. Follow your Kiro/AWS terms for the accounts you use.
 
 ## Contributing and security
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md),
+[SECURITY.md](SECURITY.md) for private vulnerability reports, and
+[CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## License
 
-MIT
+[MIT](LICENSE) © beyondfashion-ai

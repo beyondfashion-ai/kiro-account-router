@@ -1,0 +1,1085 @@
+#!/usr/bin/env bash
+# Part of kiro-account-router (https://github.com/beyondfashion-ai/kiro-account-router).
+# kiro-auto — slot-based, usage-aware Kiro CLI account selector.
+#
+# A "slot" is one place a Kiro account can be logged in:
+#   - windows : the Windows Kiro CLI (kiro-cli.exe via WSL interop)
+#   - wsl     : the Linux Kiro CLI, default data dir or an extra XDG_DATA_HOME
+#               directory created with `kiro account add NAME`
+# Whatever account is logged in to a slot is used. Emails are not hardcoded;
+# an optional pin_email column in the slots file can restrict a slot.
+#
+# Selection happens before a chat starts only. A started chat is never
+# replayed on another account (that could duplicate output or tool actions).
+
+set -uo pipefail
+
+BIN_DIR="$HOME/.local/bin"
+CONFIG_DIR="${KIRO_AUTO_CONFIG_DIR:-$HOME/.config/kiro-auto}"
+SLOTS_FILE="$CONFIG_DIR/slots"
+PREFER_FILE="$CONFIG_DIR/prefer"
+STATE_ROOT="$HOME/.local/share/kiro-auto"
+SLOT_DATA_ROOT="$STATE_ROOT/slots"
+SHIM_TEMPLATE="$STATE_ROOT/kiro-cli-shim"
+DEFAULT_KIRO_DATA="$HOME/.local/share/kiro-cli"
+# Shared with install.sh / uninstall.sh (same path, same lock names).
+LOCK_DIR="$STATE_ROOT/locks"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+SHIM_MARKER='kiro-auto-shim'
+
+is_shim() {
+  [[ -f "$1" ]] && head -c 512 "$1" 2>/dev/null | grep -q "$SHIM_MARKER"
+}
+
+# Real Linux Kiro CLI: explicit override, else kiro-cli-real (shim installed)
+# or kiro-cli (--no-shim), falling back to the other. Never the shim.
+detect_wsl_cli() {
+  if [[ -n "${KIRO_AUTO_WSL_CLI:-}" ]]; then
+    # An override pointing at the shim or this router would recurse forever.
+    if is_shim "$KIRO_AUTO_WSL_CLI" || [[ "$KIRO_AUTO_WSL_CLI" -ef "$SELF" ]]; then
+      die 2 "KIRO_AUTO_WSL_CLI must be the real Kiro CLI (e.g. $BIN_DIR/kiro-cli-real), not the shim or kiro-auto"
+    fi
+    printf '%s' "$KIRO_AUTO_WSL_CLI"
+    return
+  fi
+  local order=("$BIN_DIR/kiro-cli" "$BIN_DIR/kiro-cli-real")
+  # With the shim installed, kiro-cli-real is the known-good binary; a non-shim
+  # kiro-cli then is an update in progress or not yet healed.
+  [[ -f "$SHIM_TEMPLATE" ]] && order=("$BIN_DIR/kiro-cli-real" "$BIN_DIR/kiro-cli")
+  local c=""
+  for c in "${order[@]}"; do
+    if [[ -f "$c" && -x "$c" ]] && ! is_shim "$c"; then
+      printf '%s' "$c"
+      return
+    fi
+  done
+}
+
+# Windows Kiro CLI: explicit override; otherwise the only per-user install, or
+# the current Windows user's install when several profiles have one.
+detect_windows_cli() {
+  if [[ -n "${KIRO_AUTO_WINDOWS_CLI:-}" ]]; then
+    printf '%s' "$KIRO_AUTO_WINDOWS_CLI"
+    return
+  fi
+  local matches=()
+  local candidate=""
+  for candidate in /mnt/c/Users/*/AppData/Local/Kiro-Cli/kiro-cli.exe; do
+    [[ -f "$candidate" ]] && matches+=("$candidate")
+  done
+  if ((${#matches[@]} == 1)); then
+    printf '%s' "${matches[0]}"
+  elif ((${#matches[@]} > 1)) && command -v cmd.exe >/dev/null && command -v wslpath >/dev/null; then
+    local appdata=""
+    appdata="$(cd /mnt/c 2>/dev/null && cmd.exe /d /c 'echo %LOCALAPPDATA%' 2>/dev/null | tr -d '\r')"
+    [[ -n "$appdata" ]] || return 0
+    candidate="$(wslpath -u "$appdata" 2>/dev/null)/Kiro-Cli/kiro-cli.exe"
+    [[ -f "$candidate" ]] && printf '%s' "$candidate"
+  fi
+}
+
+KIRO_USAGE_BIN="${KIRO_AUTO_USAGE_BIN:-$BIN_DIR/kiro-usage}"
+# No model is forced unless KIRO_AUTO_MODEL is set.
+DEFAULT_MODEL="${KIRO_AUTO_MODEL:-}"
+TIMEOUT_BIN="$(type -P timeout || true)"
+FLOCK_BIN="$(type -P flock || true)"
+
+declare -a SLOTS=()
+declare -A SLOT_KIND=() SLOT_DATA=() SLOT_PIN=()
+declare -A P_STATE=() P_EMAIL=() P_USED=() P_LIMIT=()
+declare -a CMD=()
+
+# ---------------------------------------------------------------- utilities
+
+diag() {
+  if [[ "${KIRO_AUTO_DIAGNOSTICS:-stdout}" == "stderr" ]]; then
+    printf '%s\n' "$*" >&2
+  else
+    printf '%s\n' "$*"
+  fi
+}
+
+die() {
+  local code="$1"
+  shift
+  printf 'kiro-auto: %s\n' "$*" >&2
+  exit "$code"
+}
+
+strip_ansi() {
+  sed $'s/\033\\[[0-9;?]*[ -\\/]*[@-~]//g' | tr -d '\r'
+}
+
+is_tty() {
+  [[ -t 0 && -t 1 ]]
+}
+
+valid_slot_name() {
+  [[ "$1" =~ ^[A-Za-z][A-Za-z0-9_-]{0,31}$ ]]
+}
+
+windows_interop_available() {
+  [[ -e /proc/sys/fs/binfmt_misc/WSLInterop ]] || return 1
+  if [[ -n "${WSL_INTEROP:-}" && -S "$WSL_INTEROP" ]]; then
+    return 0
+  fi
+  local candidate=""
+  for candidate in /run/WSL/*_interop; do
+    [[ -S "$candidate" ]] || continue
+    export WSL_INTEROP="$candidate"
+    return 0
+  done
+  return 1
+}
+
+private_dir() {
+  mkdir -p "$1" && chmod 700 "$1"
+}
+
+# Open fd 9 on a private per-user lock file and take an exclusive lock.
+take_lock() {
+  local name="$1"
+  local wait="${2:-30}"
+  [[ -n "$FLOCK_BIN" ]] || return 2
+  private_dir "$LOCK_DIR" || return 1
+  local file="$LOCK_DIR/$name.lock"
+  [[ ! -L "$file" ]] || return 1
+  exec 9>>"$file" || return 1
+  "$FLOCK_BIN" -w "$wait" 9
+}
+
+# `kiro-cli update` replaces ~/.local/bin/kiro-cli with a new binary, which
+# would silently remove the routing shim. Move the new binary to
+# kiro-cli-real and reinstall the shim. Active only when install.sh put the
+# shim template in place (not with --no-shim). Disable with KIRO_AUTO_SHIM=0.
+# Core of the self-heal; the caller must hold the heal lock.
+heal_locked() {
+  local target="$BIN_DIR/kiro-cli"
+  local real="$BIN_DIR/kiro-cli-real"
+  is_shim "$target" && return 0
+  [[ -f "$target" && -x "$target" ]] || return 0
+  if ! is_shim "$SHIM_TEMPLATE"; then
+    printf 'kiro-auto: shim template %s is invalid; re-run install.sh\n' "$SHIM_TEMPLATE" >&2
+    return 1
+  fi
+  local staged=""
+  staged="$(mktemp "$BIN_DIR/.kiro-cli-shim.XXXXXX")" || return 1
+  if ! cp "$SHIM_TEMPLATE" "$staged" || ! chmod 755 "$staged"; then
+    rm -f "$staged"
+    return 1
+  fi
+  if [[ -f "$real" ]] && ! is_shim "$real"; then
+    mv -f "$real" "$real.prev" || { rm -f "$staged"; return 1; }
+  fi
+  if ! mv -f "$target" "$real"; then
+    [[ -f "$real.prev" ]] && mv -f "$real.prev" "$real"
+    rm -f "$staged"
+    return 1
+  fi
+  if ! mv -f "$staged" "$target"; then
+    mv -f "$real" "$target"
+    rm -f "$staged"
+    return 1
+  fi
+  printf 'kiro-auto: reinstalled kiro-cli routing shim (real binary: %s, previous: %s.prev)\n' \
+    "$real" "$real" >&2
+}
+
+shim_mode() {
+  [[ "${KIRO_AUTO_SHIM:-1}" == "1" && -f "$SHIM_TEMPLATE" && -z "${KIRO_AUTO_WSL_CLI:-}" ]]
+}
+
+heal_shim() {
+  shim_mode || return 0
+  [[ -f "$BIN_DIR/kiro-cli" ]] || return 0
+  is_shim "$BIN_DIR/kiro-cli" && return 0
+  # Serialize with install/uninstall/update; recheck under the lock. If the
+  # lock stays busy (e.g. an update is running), leave files alone.
+  (
+    take_lock heal 10 || exit 0
+    heal_locked ||
+      printf 'kiro-auto: warning: could not reinstall the kiro-cli shim; direct kiro-cli calls bypass routing (re-run install.sh)\n' >&2
+  )
+}
+
+# Run `kiro-cli update` inside the lifecycle lock. On success the new binary
+# becomes kiro-cli-real; on failure a changed kiro-cli is moved aside and the
+# known-good kiro-cli-real stays active.
+run_update() {
+  local slot="$1"
+  shift
+  if [[ "${SLOT_KIND[$slot]}" != "wsl" ]] || ! shim_mode; then
+    slot_run_admin "$slot" "$@"
+    return
+  fi
+  (
+    take_lock heal 60 || die 73 "another install/update is running"
+    slot_run_admin "$slot" "$@"
+    rc=$?
+    if ((rc == 0)); then
+      if ! heal_locked || ! is_shim "$BIN_DIR/kiro-cli"; then
+        printf 'kiro-auto: update succeeded but the routing shim could not be restored; re-run install.sh\n' >&2
+        exit 70
+      fi
+    elif ! is_shim "$BIN_DIR/kiro-cli"; then
+      if [[ -e "$BIN_DIR/kiro-cli" ]]; then
+        mv -f "$BIN_DIR/kiro-cli" "$BIN_DIR/kiro-cli.failed-update"
+        printf 'kiro-auto: update failed (exit %s); its output was moved to %s\n' \
+          "$rc" "$BIN_DIR/kiro-cli.failed-update" >&2
+      fi
+      install -m 755 "$SHIM_TEMPLATE" "$BIN_DIR/kiro-cli"
+    fi
+    exit "$rc"
+  )
+}
+
+# ---------------------------------------------------------------- slots
+
+ensure_slots_file() {
+  if [[ -f "$SLOTS_FILE" ]]; then
+    # Tighten permissions left by older versions or manual edits.
+    [[ -O "$CONFIG_DIR" ]] && chmod 700 "$CONFIG_DIR" 2>/dev/null
+    [[ -O "$SLOTS_FILE" && ! -L "$SLOTS_FILE" ]] && chmod 600 "$SLOTS_FILE" 2>/dev/null
+    return 0
+  fi
+  private_dir "$CONFIG_DIR" || die 73 "cannot create $CONFIG_DIR"
+  (umask 077 && : >"$SLOTS_FILE") || die 73 "cannot create $SLOTS_FILE"
+  local windows_line="windows     windows   -         -"
+  [[ -n "$WINDOWS_CLI" ]] || windows_line="# windows   windows   -         -   (no Windows Kiro CLI detected)"
+  cat >"$SLOTS_FILE" <<EOF
+# kiro-auto slots. Line order is the default preference (top first).
+#   name      : any short name (letters, digits, - _)
+#   kind      : wsl (Linux kiro-cli) | windows (kiro-cli.exe via WSL interop)
+#   data_dir  : "-" = default location; otherwise an XDG_DATA_HOME directory (wsl only)
+#   pin_email : "-" = accept whichever account is logged in; an email = refuse others
+# Manage with: kiro account add NAME | kiro account rm NAME | kiro use NAME|auto
+# name      kind      data_dir  pin_email
+wsl         wsl       -         -
+$windows_line
+EOF
+}
+
+load_slots() {
+  ensure_slots_file
+  local name kind data pin
+  while read -r name kind data pin _; do
+    [[ -z "$name" || "$name" == \#* ]] && continue
+    if ! valid_slot_name "$name"; then
+      printf 'kiro-auto: ignoring slot with invalid name: %s\n' "$name" >&2
+      continue
+    fi
+    case "$kind" in
+      wsl | windows) ;;
+      *)
+        printf 'kiro-auto: ignoring slot %s: unknown kind %s\n' "$name" "$kind" >&2
+        continue
+        ;;
+    esac
+    data="${data:--}"
+    data="${data/#\~/$HOME}"
+    if [[ -n "${SLOT_KIND[$name]:-}" ]]; then
+      die 78 "duplicate slot name in $SLOTS_FILE: $name"
+    fi
+    if [[ "$data" != "-" && ( "$kind" != "wsl" || "$data" != /* ) ]]; then
+      printf 'kiro-auto: ignoring slot %s: data_dir must be an absolute path on a wsl slot\n' "$name" >&2
+      continue
+    fi
+    SLOTS+=("$name")
+    SLOT_KIND[$name]="$kind"
+    SLOT_DATA[$name]="$data"
+    SLOT_PIN[$name]="${pin:--}"
+  done <"$SLOTS_FILE"
+  ((${#SLOTS[@]})) || die 78 "no slots configured in $SLOTS_FILE"
+}
+
+reload_slots() {
+  SLOTS=()
+  SLOT_KIND=()
+  SLOT_DATA=()
+  SLOT_PIN=()
+  load_slots
+}
+
+# Serialize slots/preference edits across processes, then re-read the file so
+# checks run against the latest state. Released with release_config_lock.
+lock_config() {
+  take_lock config 30 || die 73 "slots file is busy (or flock is missing); try again"
+  reload_slots
+}
+
+release_config_lock() {
+  exec 9>&-
+}
+
+resolve_slot_name() {
+  local want="${1#@}"
+  local s=""
+  for s in "${SLOTS[@]}"; do
+    if [[ "$s" == "$want" ]]; then
+      printf '%s\n' "$s"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Accepts a slot name or a 1-based number as shown in listings and menus
+# (preference order, same as `kiro accounts`).
+resolve_slot() {
+  local want="${1#@}"
+  resolve_slot_name "$want" && return 0
+  [[ "$want" =~ ^[1-9][0-9]*$ ]] || return 1
+  local order=()
+  mapfile -t order < <(ordered_slots)
+  ((want <= ${#order[@]})) || return 1
+  printf '%s\n' "${order[want - 1]}"
+}
+
+ordered_slots() {
+  local prefer="${KIRO_AUTO_PREFER:-}"
+  if [[ -z "$prefer" && -f "$PREFER_FILE" ]]; then
+    prefer="$(<"$PREFER_FILE")"
+  fi
+  local first=""
+  [[ -n "$prefer" ]] && first="$(resolve_slot_name "$prefer" || true)"
+  [[ -n "$first" ]] && printf '%s\n' "$first"
+  local s=""
+  for s in "${SLOTS[@]}"; do
+    [[ "$s" == "$first" ]] || printf '%s\n' "$s"
+  done
+}
+
+slot_cli() {
+  if [[ "${SLOT_KIND[$1]}" == "windows" ]]; then
+    printf '%s' "${WINDOWS_CLI:-/nonexistent/kiro-cli.exe}"
+  else
+    printf '%s' "$WSL_CLI"
+  fi
+}
+
+# Environment prefix for commands that run against a slot.
+slot_env_prefix() {
+  local slot="$1"
+  CMD=()
+  [[ "${SLOT_KIND[$slot]}" == "wsl" ]] || return 0
+  # Always set or clear XDG_DATA_HOME explicitly so an inherited value (e.g.
+  # from a session on another slot) never changes which login is used.
+  if [[ "${SLOT_DATA[$slot]}" != "-" ]]; then
+    CMD=(env "XDG_DATA_HOME=${SLOT_DATA[$slot]}")
+  else
+    CMD=(env -u XDG_DATA_HOME)
+  fi
+}
+
+slot_label() {
+  local slot="$1"
+  local extra=""
+  [[ "${SLOT_DATA[$slot]}" != "-" ]] && extra=", extra"
+  printf '%s (%s%s)' "$slot" "${SLOT_KIND[$slot]}" "$extra"
+}
+
+# Run a short, read-only Kiro command against a slot. Only Windows probes are
+# retried (transient WSL bridge startup); a model chat is never replayed.
+slot_probe_cmd() {
+  local slot="$1"
+  shift
+  local cli=""
+  cli="$(slot_cli "$slot")"
+  slot_env_prefix "$slot"
+  CMD+=("$cli")
+  local attempts=1
+  if [[ "${SLOT_KIND[$slot]}" == "windows" ]]; then
+    windows_interop_available || return 125
+    attempts=3
+  fi
+  local attempt=1
+  local output=""
+  local rc=0
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    if [[ -n "$TIMEOUT_BIN" ]]; then
+      output="$("$TIMEOUT_BIN" 20s "${CMD[@]}" "$@" 2>&1 </dev/null)"
+    else
+      output="$("${CMD[@]}" "$@" 2>&1 </dev/null)"
+    fi
+    rc=$?
+    if ((rc == 0)) || [[ "$output" == *"Not logged in"* ]]; then
+      printf '%s\n' "$output"
+      return "$rc"
+    fi
+    ((attempt < attempts)) && sleep 1
+  done
+  return 1
+}
+
+slot_usage_text() {
+  local slot="$1"
+  [[ -x "$KIRO_USAGE_BIN" ]] || return 1
+  local cli=""
+  cli="$(slot_cli "$slot")"
+  local max_attempts="${KIRO_AUTO_USAGE_ATTEMPTS:-3}"
+  [[ "$max_attempts" =~ ^[1-9][0-9]*$ ]] || max_attempts=3
+  local attempt=1
+  local output=""
+  slot_env_prefix "$slot"
+  local prefix=("${CMD[@]}")
+  while ((attempt <= max_attempts)); do
+    # /usage is a TUI command; kiro-usage reads it through a bounded tmux PTY.
+    output="$("${prefix[@]}" "$KIRO_USAGE_BIN" "$cli" 2>&1 </dev/null | strip_ansi)"
+    if [[ "$output" == *"Credits ("* ]]; then
+      printf '%s\n' "$output"
+      return 0
+    fi
+    ((attempt < max_attempts)) && sleep 1
+    ((attempt++))
+  done
+  return 1
+}
+
+usage_numbers() {
+  sed -nE 's/.*Credits \(([0-9]+([.][0-9]+)?) of ([0-9]+([.][0-9]+)?) covered in plan\).*/\1 \3/p' | head -n 1
+}
+
+# Prints: state<TAB>email<TAB>used<TAB>limit
+# states: available full unknown logged-in not-logged-in pin-mismatch
+#         bridge-unavailable not-installed
+probe_slot() {
+  local slot="$1"
+  local mode="${2:-full}"
+  local cli=""
+  cli="$(slot_cli "$slot")"
+  if [[ "${SLOT_KIND[$slot]}" == "windows" ]] && ! windows_interop_available; then
+    printf 'bridge-unavailable\t-\t-\t-\n'
+    return
+  fi
+  if [[ ! -x "$cli" ]]; then
+    printf 'not-installed\t-\t-\t-\n'
+    return
+  fi
+  local email=""
+  local out=""
+  local rc=0
+  out="$(slot_probe_cmd "$slot" whoami)"
+  rc=$?
+  email="$(printf '%s\n' "$out" | tr -d '\r' | sed -n 's/^Email: //p' | head -n 1)"
+  if [[ -z "$email" ]]; then
+    # Only Kiro's own answer means logged out; timeouts, crashes, and bridge
+    # errors are reported as probe-error so nobody re-logs in needlessly.
+    if [[ "$out" == *"Not logged in"* ]]; then
+      printf 'not-logged-in\t-\t-\t-\n'
+    else
+      printf 'probe-error\t-\t-\t(exit %s)\n' "$rc"
+    fi
+    return
+  fi
+  local pin="${SLOT_PIN[$slot]}"
+  if [[ "$pin" != "-" && "${email,,}" != "${pin,,}" ]]; then
+    printf 'pin-mismatch\t%s\t-\t-\n' "$email"
+    return
+  fi
+  if [[ "$mode" == "identity" ]]; then
+    printf 'logged-in\t%s\t-\t-\n' "$email"
+    return
+  fi
+  local usage=""
+  local used=""
+  local limit=""
+  local state="unknown"
+  if usage="$(slot_usage_text "$slot")"; then
+    read -r used limit <<<"$(printf '%s\n' "$usage" | usage_numbers)"
+    if [[ -n "$used" && -n "$limit" ]]; then
+      if awk -v u="$used" -v l="$limit" 'BEGIN { exit !(u >= l) }'; then
+        state="full"
+      else
+        state="available"
+      fi
+    fi
+  fi
+  printf '%s\t%s\t%s\t%s\n' "$state" "$email" "${used:--}" "${limit:--}"
+}
+
+# Probe slots in parallel and fill P_* arrays.
+probe_all() {
+  local mode="$1"
+  shift
+  local tmp=""
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/kiro-auto.XXXXXX")" || die 73 "cannot create a temporary directory"
+  # One overall deadline per probe wave. timeout signals the probe's whole
+  # process group, so kiro-usage's trap also removes its tmux session.
+  local deadline="${KIRO_AUTO_PROBE_DEADLINE:-45}"
+  # Reuse detection results in the child probes (not exported further).
+  local child_env=(env "KIRO_AUTO_SHIM=0")
+  [[ -n "$WINDOWS_CLI" ]] && child_env+=("KIRO_AUTO_WINDOWS_CLI=$WINDOWS_CLI")
+  [[ -n "$WSL_CLI" ]] && child_env+=("KIRO_AUTO_WSL_CLI=$WSL_CLI")
+  [[ "$deadline" =~ ^[1-9][0-9]*$ ]] || deadline=45
+  local s=""
+  for s in "$@"; do
+    if [[ -n "$TIMEOUT_BIN" ]]; then
+      "${child_env[@]}" "$TIMEOUT_BIN" -k 5 "$deadline" "$SELF" __probe "$s" "$mode" >"$tmp/$s" 2>/dev/null </dev/null &
+    else
+      probe_slot "$s" "$mode" >"$tmp/$s" 2>/dev/null </dev/null &
+    fi
+  done
+  wait
+  for s in "$@"; do
+    if ! IFS=$'\t' read -r "P_STATE[$s]" "P_EMAIL[$s]" "P_USED[$s]" "P_LIMIT[$s]" <"$tmp/$s"; then
+      P_STATE[$s]="unknown"
+      P_EMAIL[$s]="-"
+      P_USED[$s]="-"
+      P_LIMIT[$s]="-"
+    fi
+  done
+  rm -rf "$tmp"
+}
+
+auto_pick() {
+  local s=""
+  for s in "$@"; do
+    if [[ "${P_STATE[$s]:-}" == "available" ]]; then
+      printf '%s\n' "$s"
+      return 0
+    fi
+  done
+  return 1
+}
+
+slot_summary() {
+  local slot="$1"
+  local email="${P_EMAIL[$slot]:--}"
+  local credits="-"
+  [[ "${P_USED[$slot]:--}" != "-" ]] && credits="${P_USED[$slot]}/${P_LIMIT[$slot]} credits"
+  [[ "$email" == "-" ]] && email="(none)"
+  printf '%s  %s  %s  [%s]' "$(slot_label "$slot")" "$email" "$credits" "${P_STATE[$slot]:-unknown}"
+}
+
+print_table() {
+  local auto="$1"
+  shift
+  local i=0
+  local s=""
+  local mark=""
+  local credits=""
+  for s in "$@"; do
+    ((i++))
+    mark=" "
+    [[ "$s" == "$auto" ]] && mark="*"
+    credits="-"
+    [[ "${P_USED[$s]:--}" != "-" ]] && credits="${P_USED[$s]}/${P_LIMIT[$s]}"
+    printf '%s %d) %-22s %-34s %-16s %s\n' "$mark" "$i" "$(slot_label "$s")" \
+      "${P_EMAIL[$s]:--}" "$credits" "${P_STATE[$s]:-unknown}"
+  done
+}
+
+# ---------------------------------------------------------------- actions
+
+slot_exec_admin() {
+  local slot="$1"
+  shift
+  if [[ "${SLOT_KIND[$slot]}" == "windows" ]]; then
+    windows_interop_available || die 125 "Windows slot unavailable: WSL↔Windows interop is inactive"
+  fi
+  local cli=""
+  cli="$(slot_cli "$slot")"
+  slot_env_prefix "$slot"
+  exec "${CMD[@]}" "$cli" "$@"
+}
+
+slot_run_admin() {
+  local slot="$1"
+  shift
+  if [[ "${SLOT_KIND[$slot]}" == "windows" ]]; then
+    windows_interop_available || {
+      printf 'Windows slot unavailable: WSL↔Windows interop is inactive\n' >&2
+      return 125
+    }
+  fi
+  local cli=""
+  cli="$(slot_cli "$slot")"
+  slot_env_prefix "$slot"
+  "${CMD[@]}" "$cli" "$@"
+}
+
+account_add() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die 2 "usage: kiro account add NAME"
+  valid_slot_name "$name" || die 2 "invalid slot name: $name (letters, digits, - _; start with a letter)"
+  lock_config
+  [[ -z "${SLOT_KIND[$name]:-}" ]] || die 2 "slot already exists: $name"
+  local dir="$SLOT_DATA_ROOT/$name"
+  private_dir "$SLOT_DATA_ROOT" && private_dir "$dir" && private_dir "$dir/kiro-cli" ||
+    die 73 "cannot create private login directory $dir"
+  # Share the large runtime files instead of re-downloading them per account.
+  local f=""
+  for f in bun bun.sha256 node node.sha256 tui.js tui.js.sha256; do
+    if [[ -e "$DEFAULT_KIRO_DATA/$f" && ! -e "$dir/kiro-cli/$f" ]]; then
+      ln -s "$DEFAULT_KIRO_DATA/$f" "$dir/kiro-cli/$f" ||
+        printf 'kiro-auto: warning: could not link %s (Kiro will download it)\n' "$f" >&2
+    fi
+  done
+  printf '%-11s %-9s %s  -\n' "$name" "wsl" "$dir" >>"$SLOTS_FILE" ||
+    die 73 "cannot write $SLOTS_FILE"
+  SLOTS+=("$name")
+  SLOT_KIND[$name]="wsl"
+  SLOT_DATA[$name]="$dir"
+  SLOT_PIN[$name]="-"
+  release_config_lock
+  printf 'Added slot %s (data: %s).\n' "$name" "$dir"
+  if is_tty; then
+    local ans=""
+    read -r -p "Log in to slot $name now? [Y/n] " ans </dev/tty || ans="n"
+    if [[ -z "$ans" || "$ans" =~ ^[Yy] ]]; then
+      slot_run_admin "$name" login
+    fi
+  else
+    printf 'Log in with: kiro login %s\n' "$name"
+  fi
+}
+
+account_rm() {
+  local name=""
+  lock_config
+  name="$(resolve_slot "${1:-}")" || die 2 "unknown slot: ${1:-}"
+  ((${#SLOTS[@]} > 1)) || die 2 "refusing to remove the last slot"
+  local tmp=""
+  tmp="$(mktemp "$CONFIG_DIR/.slots.XXXXXX")" || die 73 "cannot create a temporary file in $CONFIG_DIR"
+  if ! awk -v n="$name" '($1 == n) { next } { print }' "$SLOTS_FILE" >"$tmp" ||
+    ! mv -f "$tmp" "$SLOTS_FILE"; then
+    rm -f "$tmp"
+    die 73 "cannot update $SLOTS_FILE"
+  fi
+  if [[ -f "$PREFER_FILE" && "$(<"$PREFER_FILE")" == "$name" ]]; then
+    rm -f "$PREFER_FILE"
+  fi
+  printf 'Removed slot %s from %s.\n' "$name" "$SLOTS_FILE"
+  if [[ "${SLOT_DATA[$name]}" != "-" ]]; then
+    printf 'Login data kept at %s (delete manually if no longer needed).\n' "${SLOT_DATA[$name]}"
+  fi
+}
+
+cmd_use() {
+  local want="${1:-}"
+  [[ -n "$want" ]] || die 2 "usage: kiro use NAME|auto"
+  lock_config
+  if [[ "$want" == "auto" ]]; then
+    rm -f "$PREFER_FILE"
+    printf 'Preference cleared: slots file order is used (%s).\n' "$SLOTS_FILE"
+    return 0
+  fi
+  local slot=""
+  slot="$(resolve_slot "$want")" || die 2 "unknown slot: $want"
+  private_dir "$CONFIG_DIR" && (umask 077 && printf '%s\n' "$slot" >"$PREFER_FILE") ||
+    die 73 "cannot write $PREFER_FILE"
+  printf 'Preferred slot: %s (falls back to others when it has no credits).\n' "$slot"
+}
+
+cmd_status() {
+  local order=()
+  mapfile -t order < <(ordered_slots)
+  probe_all full "${order[@]}"
+  local auto=""
+  auto="$(auto_pick "${order[@]}" || true)"
+  print_table "$auto" "${order[@]}"
+  if [[ -n "$auto" ]]; then
+    printf '* = auto choice\n'
+  else
+    printf 'No slot is verified as available.\n'
+  fi
+}
+
+account_help() {
+  cat <<EOF
+kiro account commands (slots file: $SLOTS_FILE)
+  kiro                      interactive account picker, then chat
+  kiro @NAME [args]         chat on a specific slot (also KIRO_AUTO_FORCE=NAME)
+  kiro accounts             list slots with account, credits, state
+  kiro use NAME|auto        set / clear the preferred slot
+  kiro login|logout NAME    log in / out of one slot (no NAME: choose)
+  kiro whoami [NAME]        show logged-in accounts
+  kiro account add NAME     add an extra WSL login slot
+  kiro account rm NAME      remove a slot from the list
+Environment: KIRO_AUTO_PICKER=0 (skip picker), KIRO_AUTO_PICKER_TIMEOUT=30
+EOF
+}
+
+# Choose a slot, printing a menu over the terminal. Sets PICKED.
+choose_slot_menu() {
+  local mode="$1"
+  local order=()
+  mapfile -t order < <(ordered_slots)
+  probe_all "$mode" "${order[@]}"
+  print_table "" "${order[@]}" >&2
+  local ans=""
+  read -r -p "Slot number/name (q=cancel): " ans </dev/tty || return 1
+  [[ -z "$ans" || "$ans" == "q" ]] && return 1
+  PICKED="$(resolve_slot "$ans")" || {
+    printf 'unknown slot: %s\n' "$ans" >&2
+    return 1
+  }
+}
+
+cmd_slot_admin() {
+  local action="$1"
+  shift
+  local slot="$FORCE_SLOT"
+  if [[ -z "$slot" && -n "${1:-}" && "${1:-}" != -* ]]; then
+    slot="$(resolve_slot "$1")" || die 2 "unknown slot: $1 (see: kiro accounts)"
+    shift
+  fi
+  # Inside a routed chat, default to that chat's slot.
+  if [[ -z "$slot" && -n "${KIRO_AUTO_SLOT:-}" ]]; then
+    slot="$(resolve_slot "$KIRO_AUTO_SLOT" || true)"
+  fi
+  if [[ -z "$slot" && "$action" == "whoami" ]]; then
+    local order=()
+    mapfile -t order < <(ordered_slots)
+    probe_all identity "${order[@]}"
+    print_table "" "${order[@]}"
+    return 0
+  fi
+  if [[ -z "$slot" ]]; then
+    if is_tty; then
+      printf 'Choose a slot to %s:\n' "$action" >&2
+      PICKED=""
+      choose_slot_menu identity || exit 1
+      slot="$PICKED"
+    else
+      die 2 "$action needs a slot when not on a terminal: kiro $action NAME (see: kiro accounts)"
+    fi
+  fi
+  if [[ "$action" == "login" ]]; then
+    printf 'Logging in to slot %s. Use the account you want this slot to hold.\n' "$(slot_label "$slot")" >&2
+  fi
+  slot_exec_admin "$slot" "$action" "$@"
+}
+
+has_arg() {
+  local needle=""
+  local arg=""
+  for arg in "${@:2}"; do
+    for needle in $1; do
+      if [[ "$arg" == "$needle" || "$arg" == "$needle"=* ]]; then
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+set_global_model() {
+  local slot="$1"
+  local model="$2"
+  slot_probe_cmd "$slot" settings --global chat.defaultModel "$model" >/dev/null
+}
+
+acquire_model_lock() {
+  # Settings are per installation (~/.kiro is shared by all wsl slots).
+  take_lock "model-${SLOT_KIND[$1]}" 30
+}
+
+run_chat() {
+  local slot="$1"
+  shift
+  local cli=""
+  cli="$(slot_cli "$slot")"
+  local default_args=()
+  local configure_model="${KIRO_AUTO_CONFIGURE_MODEL:-0}"
+  # Raw `kiro-cli chat` calls routed through the shim keep their own flags.
+  if [[ "${KIRO_AUTO_VIA_SHIM:-0}" != "1" && "$SUBCMD" == chat ]]; then
+    if [[ -n "$DEFAULT_MODEL" && "$configure_model" != "1" ]] && ! has_arg "--model" "$@"; then
+      default_args+=(--model "$DEFAULT_MODEL")
+    fi
+    if [[ -n "${KIRO_AUTO_AGENT:-}" ]] && ! has_arg "--agent" "$@"; then
+      default_args+=(--agent "$KIRO_AUTO_AGENT")
+    fi
+    if [[ "${KIRO_AUTO_TRUST_ALL:-0}" == "1" ]] && ! has_arg "--trust-all-tools --trust-tools" "$@"; then
+      default_args+=(--trust-all-tools)
+    fi
+  fi
+  if [[ "${SLOT_KIND[$slot]}" == "windows" ]]; then
+    windows_interop_available || die 125 "Windows slot unavailable: WSL↔Windows interop is inactive"
+  fi
+  if [[ "${KIRO_AUTO_DRY_RUN:-0}" == "1" ]]; then
+    [[ "$configure_model" == "1" ]] && printf 'Would set global model: %s\n' "$DEFAULT_MODEL"
+    [[ "${SLOT_DATA[$slot]}" != "-" ]] && printf 'Would set XDG_DATA_HOME=%s\n' "${SLOT_DATA[$slot]}"
+    printf 'Would run: %s' "$cli"
+    ((${#PRE_ARGS[@]})) && printf ' %q' "${PRE_ARGS[@]}"
+    printf ' %s' "$SUBCMD"
+    printf ' %q' "${default_args[@]}" "$@"
+    printf '\n'
+    exit 0
+  fi
+  if [[ "$configure_model" == "1" ]]; then
+    [[ -n "$FLOCK_BIN" ]] || die 73 "flock is required to set the model safely (install util-linux)."
+    [[ -n "$DEFAULT_MODEL" ]] || die 2 "KIRO_AUTO_CONFIGURE_MODEL=1 requires KIRO_AUTO_MODEL."
+    acquire_model_lock "$slot" || die 73 "Kiro model selection is busy for $slot; refusing a concurrent call."
+    set_global_model "$slot" "$DEFAULT_MODEL" || die 74 "Kiro model selection failed for $slot ($DEFAULT_MODEL)."
+  fi
+  # Last-moment identity check: the account may have changed (login/logout
+  # in another terminal) since the probe that selected this slot.
+  # Identity is always verified (even when usage was unknown and the slot was
+  # chosen manually), and pin_email is enforced here as well.
+  local expected="${P_EMAIL[$slot]:--}"
+  local now=""
+  now="$(slot_probe_cmd "$slot" whoami | tr -d '\r' | sed -n 's/^Email: //p' | head -n 1)"
+  [[ -n "$now" ]] || die 78 "slot $slot: could not verify the logged-in account; not starting"
+  local pin="${SLOT_PIN[$slot]}"
+  if [[ "$pin" != "-" && "${now,,}" != "${pin,,}" ]]; then
+    die 78 "slot $slot is pinned to $pin but $now is logged in; not starting"
+  fi
+  if [[ "$expected" != "-" && "${now,,}" != "${expected,,}" ]]; then
+    die 78 "slot $slot account changed since it was checked (${expected} -> ${now}); run again"
+  fi
+  # Informational for child processes; selector-only knobs must not leak into
+  # nested `kiro`/`kiro-cli` calls made from inside this chat.
+  export KIRO_AUTO_SLOT="$slot"
+  unset KIRO_AUTO_VIA_SHIM KIRO_AUTO_CONFIGURE_MODEL KIRO_AUTO_MODEL KIRO_AUTO_DIAGNOSTICS \
+    KIRO_AUTO_FORCE KIRO_AUTO_AGENT KIRO_AUTO_TRUST_ALL
+  if [[ "${SLOT_KIND[$slot]}" == "wsl" ]]; then
+    if [[ "${SLOT_DATA[$slot]}" != "-" ]]; then
+      export XDG_DATA_HOME="${SLOT_DATA[$slot]}"
+    else
+      unset XDG_DATA_HOME
+    fi
+  fi
+  exec "$cli" "${PRE_ARGS[@]}" "$SUBCMD" "${default_args[@]}" "$@"
+}
+
+interactive_picker() {
+  local timeout="${KIRO_AUTO_PICKER_TIMEOUT:-30}"
+  [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || timeout=30
+  local order=()
+  local auto=""
+  local ans=""
+  local target=""
+  local refresh=1
+  while true; do
+    mapfile -t order < <(ordered_slots)
+    if ((refresh)); then
+      printf 'Checking Kiro accounts...\n' >&2
+      probe_all full "${order[@]}"
+    fi
+    refresh=1
+    auto="$(auto_pick "${order[@]}" || true)"
+    print_table "$auto" "${order[@]}" >&2
+    if [[ -n "$auto" ]]; then
+      printf 'Enter=%s (auto, chosen after %ss)  N=use slot  lN=login  oN=logout  a=add account  r=refresh  q=quit\n' "$auto" "$timeout" >&2
+    else
+      printf 'No slot is available for auto selection.  N=use slot  lN=login  oN=logout  a=add account  r=refresh  q=quit\n' >&2
+    fi
+    ans=""
+    if ! read -r -t "$timeout" -p '> ' ans </dev/tty; then
+      printf '\n' >&2
+      [[ -n "$auto" ]] || die 69 "no verified Kiro slot with available credits"
+      ans=""
+    fi
+    ans="${ans//[[:space:]]/}"
+    case "$ans" in
+      "")
+        if [[ -n "$auto" ]]; then
+          PICKED="$auto"
+          return 0
+        fi
+        refresh=0
+        ;;
+      q | Q) exit 0 ;;
+      r | R) ;;
+      a | A)
+        local new_name=""
+        read -r -p 'New slot name (e.g. second): ' new_name </dev/tty || true
+        [[ -n "$new_name" ]] && (account_add "$new_name")
+        SLOTS=()
+        SLOT_KIND=()
+        SLOT_DATA=()
+        SLOT_PIN=()
+        load_slots
+        ;;
+      [lLoO]*)
+        target="$(resolve_slot "${ans:1}")" || {
+          printf 'unknown slot: %s\n' "${ans:1}" >&2
+          refresh=0
+          continue
+        }
+        if [[ "${ans:0:1}" == [lL] ]]; then
+          slot_run_admin "$target" login
+        else
+          slot_run_admin "$target" logout
+        fi
+        ;;
+      *)
+        target="$(resolve_slot "$ans")" || {
+          printf 'unknown slot: %s\n' "$ans" >&2
+          refresh=0
+          continue
+        }
+        case "${P_STATE[$target]:-unknown}" in
+          available | unknown) ;;
+          not-logged-in)
+            slot_run_admin "$target" login || true
+            continue
+            ;;
+          full)
+            local ok=""
+            read -r -p "$target is out of credits. Use it anyway? [y/N] " ok </dev/tty || ok=""
+            [[ "$ok" =~ ^[Yy] ]] || {
+              refresh=0
+              continue
+            }
+            ;;
+          *)
+            printf '%s cannot be used (%s).\n' "$target" "${P_STATE[$target]}" >&2
+            refresh=0
+            continue
+            ;;
+        esac
+        PICKED="$target"
+        return 0
+        ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------- main
+
+heal_shim
+WSL_CLI="$(detect_wsl_cli)" || exit 2
+WINDOWS_CLI="$(detect_windows_cli)"
+load_slots
+
+FORCE_SLOT=""
+force_request="${KIRO_AUTO_FORCE:-}"
+if [[ "${1:-}" == @* ]]; then
+  force_request="${1#@}"
+  shift
+fi
+if [[ -n "$force_request" ]]; then
+  FORCE_SLOT="$(resolve_slot "$force_request")" || die 78 "unknown slot: $force_request (see: kiro accounts)"
+fi
+
+# Global Kiro flags placed before `chat` (e.g. `--legacy-ui chat ...`) are
+# kept and passed in front of the subcommand.
+PRE_ARGS=()
+SUBCMD=chat
+if [[ "${1:-}" == -* && "${1:-}" != --status ]]; then
+  for ((i = 1; i <= $#; i++)); do
+    case "${!i}" in
+      --agent | --resume-id)
+        # Global options that take a separate value.
+        ((i++))
+        continue
+        ;;
+      -*) continue ;;
+    esac
+    if [[ "${!i}" == chat || "${!i}" == translate || "${!i}" == acp ]]; then
+      PRE_ARGS=("${@:1:i-1}")
+      shift "$((i - 1))"
+    fi
+    break
+  done
+fi
+
+case "${1:-}" in
+  __probe)
+    # Internal: probe one slot (used by probe_all under a deadline).
+    [[ -n "${SLOT_KIND[${2:-}]:-}" ]] || exit 2
+    probe_slot "$2" "${3:-full}"
+    exit 0
+    ;;
+  --status | status | accounts | ls)
+    cmd_status
+    exit 0
+    ;;
+  use)
+    shift
+    cmd_use "$@"
+    exit $?
+    ;;
+  account)
+    shift
+    case "${1:-help}" in
+      add)
+        shift
+        account_add "$@"
+        ;;
+      rm | remove)
+        shift
+        account_rm "$@"
+        ;;
+      list | ls) cmd_status ;;
+      *) account_help ;;
+    esac
+    exit $?
+    ;;
+  login | logout | whoami)
+    action="$1"
+    shift
+    cmd_slot_admin "$action" "$@"
+    exit $?
+    ;;
+  --version | -V | --help | -h | --help-all)
+    [[ -n "$WSL_CLI" ]] || die 127 "no Linux Kiro CLI found (expected $BIN_DIR/kiro-cli-real or $BIN_DIR/kiro-cli)"
+    exec "$WSL_CLI" "$@"
+    ;;
+  update)
+    admin_slot="${FORCE_SLOT:-$(ordered_slots | head -n 1)}"
+    run_update "$admin_slot" "$@"
+    exit $?
+    ;;
+  debug | settings | setup | diagnostic | init | theme | issue | profile | user | doctor | launch | quit | restart | integrations | dashboard | crew | mcp | inline | agent | help)
+    # Keep this list identical to PASSTHROUGH in kiro-cli-shim (tested).
+    admin_slot="${FORCE_SLOT:-$(ordered_slots | head -n 1)}"
+    slot_exec_admin "$admin_slot" "$@"
+    ;;
+  chat | translate | acp)
+    # Model-using commands: selected like a chat, then run as themselves.
+    SUBCMD="$1"
+    shift
+    # acp speaks a protocol on stdout; keep selector messages off it.
+    [[ "$SUBCMD" == chat ]] || export KIRO_AUTO_DIAGNOSTICS=stderr
+    ;;
+esac
+
+# ---- chat
+
+if [[ -n "$FORCE_SLOT" ]]; then
+  probe_all identity "$FORCE_SLOT"
+  case "${P_STATE[$FORCE_SLOT]}" in
+    logged-in) ;;
+    not-logged-in) die 78 "slot $FORCE_SLOT is not logged in (run: kiro login $FORCE_SLOT)" ;;
+    *) die 78 "slot $FORCE_SLOT unavailable: ${P_STATE[$FORCE_SLOT]} ${P_EMAIL[$FORCE_SLOT]}" ;;
+  esac
+  diag "Kiro account: ${P_EMAIL[$FORCE_SLOT]} [$(slot_label "$FORCE_SLOT")] (forced)"
+  run_chat "$FORCE_SLOT" "$@"
+fi
+
+if is_tty && [[ "$SUBCMD" == chat && "${KIRO_AUTO_PICKER:-1}" == "1" && "${KIRO_AUTO_DIAGNOSTICS:-stdout}" != "stderr" ]] &&
+  [[ "${KIRO_AUTO_VIA_SHIM:-0}" != "1" ]] &&
+  ((${#SLOTS[@]} > 1)) &&
+  ! has_arg "--no-interactive --list-sessions --delete-session --help -h" "$@"; then
+  PICKED=""
+  interactive_picker
+  diag "Kiro account: ${P_EMAIL[$PICKED]} [$(slot_label "$PICKED")]"
+  run_chat "$PICKED" "$@"
+fi
+
+mapfile -t order < <(ordered_slots)
+probe_all full "${order[@]}"
+chosen="$(auto_pick "${order[@]}" || true)"
+if [[ -n "$chosen" ]]; then
+  for s in "${order[@]}"; do
+    [[ "$s" == "$chosen" ]] && break
+    diag "Skipped: $(slot_summary "$s")"
+  done
+  diag "Using: $(slot_summary "$chosen")"
+  run_chat "$chosen" "$@"
+fi
+
+all_full=1
+for s in "${order[@]}"; do
+  diag "Unavailable: $(slot_summary "$s")"
+  [[ "${P_STATE[$s]}" == "full" ]] || all_full=0
+done
+if ((all_full)); then
+  diag "All Kiro slots are out of included credits."
+  exit 75
+fi
+diag "No verified Kiro slot with available credits could be selected safely (unknown usage is never guessed)."
+exit 69

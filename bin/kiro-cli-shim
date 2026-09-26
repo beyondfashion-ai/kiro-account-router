@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Part of kiro-account-router (https://github.com/beyondfashion-ai/kiro-account-router).
+# kiro-auto-shim — installed as ~/.local/bin/kiro-cli.
+# Routes `kiro-cli chat` (and bare `kiro-cli`) from any caller (Codex, Claude,
+# scripts) through the usage-aware slot selector ~/.local/bin/kiro-auto.
+# The real binary lives at ~/.local/bin/kiro-cli-real. kiro-auto reinstalls
+# this shim automatically after `kiro-cli update` replaces it.
+# Bypass: KIRO_AUTO_BYPASS=1 kiro-cli ...
+real="$HOME/.local/bin/kiro-cli-real"
+auto="$HOME/.local/bin/kiro-auto"
+if [[ ! -x "$real" ]] || head -c 512 "$real" 2>/dev/null | grep -q 'kiro-auto-shim'; then
+  printf 'kiro-cli shim: real Kiro CLI missing or invalid at %s (reinstall Kiro CLI, then run install.sh)\n' "$real" >&2
+  exit 127
+fi
+if [[ "${KIRO_AUTO_BYPASS:-0}" == "1" || ! -x "$auto" ]]; then
+  exec "$real" "$@"
+fi
+case "${1:-}" in
+  --version | -V | --help | -h | --help-all)
+    exec "$real" "$@"
+    ;;
+esac
+
+# Commands that never use a model; everything else is routed.
+# Keep identical to the passthrough list in kiro-auto (tested).
+PASSTHROUGH=" debug settings setup diagnostic init theme issue profile user doctor launch quit restart integrations dashboard crew mcp inline agent help "
+
+# Find the subcommand: the first positional argument, skipping global flags
+# and the values of global options that take one (--agent X, --resume-id X).
+sub=""
+only_verbose=1
+skip=0
+for arg in "$@"; do
+  if ((skip)); then
+    skip=0
+    continue
+  fi
+  case "$arg" in
+    --agent | --resume-id)
+      skip=1
+      only_verbose=0
+      ;;
+    -v | -vv | -vvv | --verbose) ;;
+    -*) only_verbose=0 ;;
+    *)
+      sub="$arg"
+      break
+      ;;
+  esac
+done
+
+case "$sub" in
+  chat | translate | acp)
+    # Model-using commands go through account selection. Global flags placed
+    # before the subcommand (e.g. `--classic chat`) are kept by kiro-auto.
+    KIRO_AUTO_VIA_SHIM=1 exec "$auto" "$@"
+    ;;
+  update | login | logout | whoami)
+    # kiro-auto runs updates under its lock and picks the slot for account
+    # commands (inside a routed chat: that chat's slot, Windows slots too).
+    [[ "${1:-}" == "$sub" ]] && exec "$auto" "$@"
+    ((only_verbose)) && exec "$real" "$@"
+    ;;
+esac
+if [[ -n "$sub" && "$PASSTHROUGH" == *" $sub "* ]] && ((only_verbose)); then
+  exec "$real" "$@"
+fi
+# Anything else (bare `kiro-cli`, `kiro-cli --resume`, `kiro-cli --agent X`,
+# or an unrecognized form) starts a chat: route it as one. Failing toward
+# routing means an odd form can at worst become a routed chat, never an
+# unrouted one.
+KIRO_AUTO_VIA_SHIM=1 exec "$auto" chat "$@"

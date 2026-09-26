@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# Part of kiro-account-router (https://github.com/beyondfashion-ai/kiro-account-router).
+# Stable non-interactive Kiro CLI delegation wrapper.
+set -o nounset
+set -o pipefail
+
+readonly KIRO_AUTO_BIN="${KIRO_AUTO_BIN:-$HOME/.local/bin/kiro-auto}"
+
+usage() {
+  cat <<'EOF'
+Usage: kiro-delegate --model MODEL [OPTIONS]
+
+Send one non-interactive prompt to Kiro CLI without a TTY wrapper.
+Terminal control sequences and Kiro's leading UI prompt marker are stripped from forwarded output.
+
+Prompt source (choose one):
+  --prompt TEXT          Prompt text (visible in process arguments; prefer stdin/--prompt-file for secrets)
+  --prompt-file PATH     Read prompt text from PATH
+  <non-TTY stdin>        Read prompt text from standard input
+
+Options:
+  --model MODEL          Required Kiro model name
+  --effort LEVEL         Kiro effort level (low, medium, high, xhigh, max)
+  --trust-read           Permit read-only filesystem inspection (fs_read; default)
+  --no-tools             Pass Kiro's explicit no-tools permission
+  --trust-all-tools      Permit all tools; use only for an implementation task
+  --resume-latest        Resume Kiro's latest session for this directory
+  --resume-id ID         Resume one Kiro session ID
+  -h, --help             Show this help
+
+Examples:
+  kiro-delegate --model MODEL --trust-read --prompt 'Review this diff.'
+  kiro-delegate --model MODEL --trust-all-tools --prompt-file task.md
+  printf '%s' 'Reply only: OK' | kiro-delegate --model MODEL
+EOF
+}
+
+error() {
+  printf 'kiro-delegate: %s\n' "$*" >&2
+  exit 2
+}
+
+read_prompt_file() {
+  local file_path="$1"
+
+  [[ -f "$file_path" ]] || error "prompt file is not a regular file: $file_path"
+  [[ -r "$file_path" ]] || error "prompt file is not readable: $file_path"
+  IFS= read -r -d '' prompt < "$file_path" || true
+}
+
+strip_terminal_control_sequences() {
+  # Kiro's non-interactive UI still emits ANSI/OSC sequences. Keep the model
+  # response readable for files and agent parsers without hiding its text.
+  "$perl_bin" -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(?:\a|\e\\)//g; s/^> // if $. == 1'
+}
+
+is_session_id() {
+  # Kiro session IDs are opaque; only reject empty, option-like, or
+  # whitespace-containing values.
+  [[ -n "$1" && "$1" != -* && "$1" != *[[:space:]]* ]]
+}
+
+model=""
+effort=""
+prompt=""
+prompt_source=""
+resume_mode=""
+resume_id=""
+trust_mode="read"
+trust_explicit=0
+
+while (($#)); do
+  case "$1" in
+    --model)
+      (($# >= 2)) || error "--model requires a value"
+      [[ -z "$model" ]] || error "--model may be specified only once"
+      model="$2"
+      shift 2
+      ;;
+    --model=*)
+      [[ -z "$model" ]] || error "--model may be specified only once"
+      model="${1#--model=}"
+      shift
+      ;;
+    --effort)
+      (($# >= 2)) || error "--effort requires a value"
+      [[ -z "$effort" ]] || error "--effort may be specified only once"
+      effort="$2"
+      shift 2
+      ;;
+    --effort=*)
+      [[ -z "$effort" ]] || error "--effort may be specified only once"
+      effort="${1#--effort=}"
+      shift
+      ;;
+    --prompt)
+      (($# >= 2)) || error "--prompt requires a value"
+      [[ -z "$prompt_source" ]] || error "choose only one prompt source"
+      prompt="$2"
+      prompt_source="option"
+      shift 2
+      ;;
+    --prompt=*)
+      [[ -z "$prompt_source" ]] || error "choose only one prompt source"
+      prompt="${1#--prompt=}"
+      prompt_source="option"
+      shift
+      ;;
+    --prompt-file)
+      (($# >= 2)) || error "--prompt-file requires a path"
+      [[ -z "$prompt_source" ]] || error "choose only one prompt source"
+      read_prompt_file "$2"
+      prompt_source="file"
+      shift 2
+      ;;
+    --prompt-file=*)
+      [[ -z "$prompt_source" ]] || error "choose only one prompt source"
+      read_prompt_file "${1#--prompt-file=}"
+      prompt_source="file"
+      shift
+      ;;
+    --trust-read)
+      ((trust_explicit == 0)) || error "choose one trust policy"
+      trust_mode="read"
+      trust_explicit=1
+      shift
+      ;;
+    --no-tools)
+      ((trust_explicit == 0)) || error "choose one trust policy"
+      trust_mode="none"
+      trust_explicit=1
+      shift
+      ;;
+    --trust-all-tools)
+      ((trust_explicit == 0)) || error "choose one trust policy"
+      trust_mode="all"
+      trust_explicit=1
+      shift
+      ;;
+    --trust-tools|--trust-tools=*)
+      error "raw --trust-tools is not accepted; use --trust-read, --no-tools, or --trust-all-tools"
+      ;;
+    --resume-latest)
+      [[ -z "$resume_mode" ]] || error "choose either --resume-latest or --resume-id"
+      resume_mode="latest"
+      shift
+      ;;
+    -r|--resume)
+      error "use --resume-latest instead of Kiro's raw --resume flag"
+      ;;
+    --resume-id)
+      (($# >= 2)) || error "--resume-id requires a session ID"
+      [[ -z "$resume_mode" ]] || error "choose either --resume-latest or --resume-id"
+      resume_id="$2"
+      resume_mode="id"
+      shift 2
+      ;;
+    --resume-id=*)
+      [[ -z "$resume_mode" ]] || error "choose either --resume-latest or --resume-id"
+      resume_id="${1#--resume-id=}"
+      resume_mode="id"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      (($# == 0)) || error "use --prompt, --prompt-file, or non-TTY stdin; positional prompts are not supported"
+      break
+      ;;
+    *)
+      error "unknown option: $1 (use --help)"
+      ;;
+  esac
+done
+
+[[ -n "$model" ]] || error "--model is required"
+
+if [[ -z "$prompt_source" ]]; then
+  [[ ! -t 0 ]] || error "provide a prompt with --prompt, --prompt-file, or non-TTY stdin"
+  IFS= read -r -d '' prompt || true
+  prompt_source="stdin"
+fi
+[[ -n "$prompt" ]] || error "prompt must not be empty"
+
+if [[ "$resume_mode" == "id" ]] && ! is_session_id "$resume_id"; then
+  error "--resume-id must be a Kiro session ID (see: kiro-cli chat --list-sessions)"
+fi
+
+if [[ -n "${KIRO_BIN:-}" ]]; then
+  # Explicit KIRO_BIN is an escape hatch for diagnostics and controlled tests.
+  # The normal path must go through the usage-aware account selector.
+  kiro_bin="$KIRO_BIN"
+  [[ -x "$kiro_bin" ]] || error "KIRO_BIN is not executable: $kiro_bin"
+  use_auto_selector=0
+else
+  [[ -x "$KIRO_AUTO_BIN" ]] || error "Kiro account selector is not executable: $KIRO_AUTO_BIN"
+  kiro_bin="$KIRO_AUTO_BIN"
+  use_auto_selector=1
+fi
+perl_bin="$(type -P perl || true)"
+[[ -n "$perl_bin" && -x "$perl_bin" ]] || error "perl is required to normalize Kiro's terminal output"
+
+# Kiro CLI 2.22.x defaults this non-interactive surface to the v1 engine,
+# which can hang. v2 is the supported non-interactive engine. The auto path
+# sets the requested model as the selected account's global default first;
+# passing --model directly to this CLI release emits a method-not-found warning
+# and can silently leave the wrong model active.
+if ((use_auto_selector)); then
+  command=("$kiro_bin" chat --agent-engine v2 --no-interactive --wrap=never)
+else
+  command=("$kiro_bin" chat --agent-engine v2 --model "$model" --no-interactive --wrap=never)
+fi
+[[ -n "$effort" ]] && command+=(--effort "$effort")
+case "$trust_mode" in
+  read) command+=(--trust-tools=fs_read) ;;
+  none) command+=(--trust-tools=) ;;
+  all) command+=(--trust-all-tools) ;;
+esac
+case "$resume_mode" in
+  latest) command+=(--resume) ;;
+  id) command+=(--resume-id "$resume_id") ;;
+esac
+
+# The prompt goes to Kiro on stdin (not argv) so it never shows up in process
+# listings. Output keeps streaming while terminal control sequences are
+# normalized; PIPESTATUS[1] preserves Kiro's exit code.
+if ((use_auto_selector)); then
+  # Selector diagnostics must not become part of the delegated model answer.
+  export KIRO_AUTO_DIAGNOSTICS=stderr KIRO_AUTO_CONFIGURE_MODEL=1 KIRO_AUTO_MODEL="$model"
+fi
+printf '%s' "$prompt" |
+  "${command[@]}" 2> >(strip_terminal_control_sequences >&2) |
+  strip_terminal_control_sequences
+kiro_status="${PIPESTATUS[1]}"
+exit "$kiro_status"

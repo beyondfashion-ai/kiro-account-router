@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Part of kiro-account-router (https://github.com/beyondfashion-ai/kiro-account-router).
+
+# Read Kiro's /usage slash command through a real terminal. Kiro CLI treats
+# /usage as a TUI command; --no-interactive sends it as a model prompt and can
+# wait forever, so this helper deliberately uses a short-lived tmux PTY.
+
+set -uo pipefail
+
+cli="${1:-}"
+if [[ -z "$cli" || ! -x "$cli" ]]; then
+  printf 'kiro-usage: executable Kiro CLI path is required\n' >&2
+  exit 2
+fi
+
+tmux_bin="$(type -P tmux || true)"
+if [[ -z "$tmux_bin" ]]; then
+  printf 'kiro-usage: tmux is required for the Kiro /usage PTY probe\n' >&2
+  exit 127
+fi
+
+if [[ "$cli" == /mnt/* ]]; then
+  if [[ ! -e /proc/sys/fs/binfmt_misc/WSLInterop ]]; then
+    printf 'kiro-usage: Windows interop is inactive (WSLInterop is not registered)\n' >&2
+    exit 125
+  fi
+  if [[ -z "${WSL_INTEROP:-}" || ! -S "$WSL_INTEROP" ]]; then
+    for candidate in /run/WSL/*_interop; do
+      [[ -S "$candidate" ]] || continue
+      export WSL_INTEROP="$candidate"
+      break
+    done
+  fi
+  if [[ -z "${WSL_INTEROP:-}" || ! -S "$WSL_INTEROP" ]]; then
+    printf 'kiro-usage: Windows interop socket is unavailable\n' >&2
+    exit 125
+  fi
+fi
+
+session="kiro-usage-${BASHPID:-$$}-${RANDOM}"
+cleanup() {
+  "$tmux_bin" kill-session -t "$session" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+# tmux accepts one shell command here. Quote every argument so an explicit
+# KIRO_AUTO_* CLI override cannot change the command structure. A tmux server
+# that is already running does not inherit this process's environment, so the
+# slot's XDG_DATA_HOME (extra kiro-auto login slots) is passed explicitly.
+# The same applies to HOME (default Kiro data dir) and WSL_INTEROP.
+# env options (-u) must precede NAME=VALUE assignments.
+if [[ -n "${XDG_DATA_HOME:-}" ]]; then
+  launch=(env "XDG_DATA_HOME=$XDG_DATA_HOME")
+else
+  launch=(env -u XDG_DATA_HOME)
+fi
+launch+=("HOME=$HOME")
+[[ -n "${WSL_INTEROP:-}" ]] && launch+=("WSL_INTEROP=$WSL_INTEROP")
+printf -v launch_command '%q ' "${launch[@]}" "$cli" --legacy-ui chat
+
+# WSL -> Windows process startup can transiently fail with
+# UtilBindVsockAnyPort. Retry only this preflight probe; never replay a model
+# chat because a partial response or tool action could be duplicated.
+started=0
+for _ in 1 2 3; do
+  if "$tmux_bin" new-session -d -s "$session" -x 120 -y 40 "$launch_command" >/dev/null 2>&1; then
+    started=1
+    break
+  fi
+  sleep 1
+done
+if ((started == 0)); then
+  printf 'kiro-usage: failed to start Kiro PTY after 3 attempts\n' >&2
+  exit 124
+fi
+
+capture_pane() {
+  "$tmux_bin" capture-pane -p -t "$session" -S -240 2>/dev/null || true
+}
+
+ready=0
+for _ in $(seq 1 25); do
+  pane="$(capture_pane)"
+  if [[ "$pane" == *"ask a question or describe a task"* ]]; then
+    ready=1
+    break
+  fi
+  "$tmux_bin" has-session -t "$session" 2>/dev/null || break
+  sleep 1
+done
+if ((ready == 0)); then
+  printf 'kiro-usage: Kiro prompt did not become ready\n' >&2
+  exit 124
+fi
+
+"$tmux_bin" send-keys -t "$session" -l -- '/usage'
+"$tmux_bin" send-keys -t "$session" Enter
+
+for _ in $(seq 1 15); do
+  pane="$(capture_pane)"
+  if [[ "$pane" == *"Estimated Usage"* && "$pane" == *"Credits ("* ]]; then
+    printf '%s\n' "$pane"
+    exit 0
+  fi
+  "$tmux_bin" has-session -t "$session" 2>/dev/null || break
+  sleep 1
+done
+
+printf 'kiro-usage: /usage did not return a readable usage panel\n' >&2
+exit 124

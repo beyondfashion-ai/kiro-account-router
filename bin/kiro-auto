@@ -55,6 +55,27 @@ detect_wsl_cli() {
   done
 }
 
+# Select a CLI executable from one Windows Kiro-Cli installation. Recent
+# releases keep versioned chat-cli executables under run/ instead of shipping
+# a stable kiro-cli.exe at the installation root.
+find_windows_cli_in_dir() {
+  local install_dir="$1"
+  local candidate=""
+  local matches=()
+
+  candidate="$install_dir/kiro-cli.exe"
+  if [[ -f "$candidate" ]]; then
+    printf '%s' "$candidate"
+    return
+  fi
+
+  for candidate in "$install_dir"/run/chat-cli-*.exe; do
+    [[ -f "$candidate" ]] && matches+=("$candidate")
+  done
+  ((${#matches[@]})) || return 0
+  printf '%s\n' "${matches[@]}" | sort -V | tail -n 1
+}
+
 # Windows Kiro CLI: explicit override; otherwise the only per-user install, or
 # the current Windows user's install when several profiles have one.
 detect_windows_cli() {
@@ -64,8 +85,11 @@ detect_windows_cli() {
   fi
   local matches=()
   local candidate=""
-  for candidate in /mnt/c/Users/*/AppData/Local/Kiro-Cli/kiro-cli.exe; do
-    [[ -f "$candidate" ]] && matches+=("$candidate")
+  local install_dir=""
+  for install_dir in /mnt/c/Users/*/AppData/Local/Kiro-Cli; do
+    [[ -d "$install_dir" ]] || continue
+    candidate="$(find_windows_cli_in_dir "$install_dir")"
+    [[ -n "$candidate" ]] && matches+=("$candidate")
   done
   if ((${#matches[@]} == 1)); then
     printf '%s' "${matches[0]}"
@@ -73,8 +97,9 @@ detect_windows_cli() {
     local appdata=""
     appdata="$(cd /mnt/c 2>/dev/null && cmd.exe /d /c 'echo %LOCALAPPDATA%' 2>/dev/null | tr -d '\r')"
     [[ -n "$appdata" ]] || return 0
-    candidate="$(wslpath -u "$appdata" 2>/dev/null)/Kiro-Cli/kiro-cli.exe"
-    [[ -f "$candidate" ]] && printf '%s' "$candidate"
+    install_dir="$(wslpath -u "$appdata" 2>/dev/null)/Kiro-Cli"
+    candidate="$(find_windows_cli_in_dir "$install_dir")"
+    [[ -n "$candidate" ]] && printf '%s' "$candidate"
   fi
 }
 
@@ -214,7 +239,23 @@ run_update() {
   fi
   (
     take_lock heal 60 || die 73 "another install/update is running"
-    slot_run_admin "$slot" "$@"
+    local target="$BIN_DIR/kiro-cli"
+    local real="$BIN_DIR/kiro-cli-real"
+    local staged=""
+    if ! is_shim "$target" || [[ ! -x "$real" ]] || is_shim "$real"; then
+      die 70 "cannot update: expected routing shim at $target and a valid real CLI at $real"
+    fi
+    # Kiro's updater refuses to run when the process is named kiro-cli-real.
+    # Stage a copy under its expected install name; keep the known-good binary
+    # and routing template untouched until the updater succeeds.
+    staged="$(mktemp "$BIN_DIR/.kiro-cli-update.XXXXXX")" || die 73 "cannot stage Kiro CLI update"
+    if ! cp "$real" "$staged" || ! chmod 755 "$staged" || ! mv -f "$staged" "$target"; then
+      rm -f "$staged"
+      install -m 755 "$SHIM_TEMPLATE" "$target" 2>/dev/null || true
+      die 73 "cannot prepare Kiro CLI updater under the expected kiro-cli name"
+    fi
+    slot_env_prefix "$slot"
+    "${CMD[@]}" "$target" "$@"
     rc=$?
     if ((rc == 0)); then
       if ! heal_locked || ! is_shim "$BIN_DIR/kiro-cli"; then
@@ -223,9 +264,11 @@ run_update() {
       fi
     elif ! is_shim "$BIN_DIR/kiro-cli"; then
       if [[ -e "$BIN_DIR/kiro-cli" ]]; then
-        mv -f "$BIN_DIR/kiro-cli" "$BIN_DIR/kiro-cli.failed-update"
+        local failed="$BIN_DIR/kiro-cli.failed-update"
+        [[ ! -e "$failed" ]] || failed="$failed.$(date +%Y%m%d%H%M%S).$$"
+        mv -f "$BIN_DIR/kiro-cli" "$failed"
         printf 'kiro-auto: update failed (exit %s); its output was moved to %s\n' \
-          "$rc" "$BIN_DIR/kiro-cli.failed-update" >&2
+          "$rc" "$failed" >&2
       fi
       install -m 755 "$SHIM_TEMPLATE" "$BIN_DIR/kiro-cli"
     fi
@@ -416,8 +459,11 @@ slot_usage_text() {
   [[ -x "$KIRO_USAGE_BIN" ]] || return 1
   local cli=""
   cli="$(slot_cli "$slot")"
-  local max_attempts="${KIRO_AUTO_USAGE_ATTEMPTS:-3}"
-  [[ "$max_attempts" =~ ^[1-9][0-9]*$ ]] || max_attempts=3
+  # One full PTY probe fits inside the parent probe deadline. Retries
+  # multiplied the 40-second inner timeout and caused the parent to kill the
+  # child before it could return even the already-verified email.
+  local max_attempts="${KIRO_AUTO_USAGE_ATTEMPTS:-1}"
+  [[ "$max_attempts" =~ ^[1-9][0-9]*$ ]] || max_attempts=1
   local attempt=1
   local output=""
   slot_env_prefix "$slot"
@@ -511,6 +557,7 @@ CACHE_DIR="$STATE_ROOT/cache"
 CACHE_TTL="${KIRO_AUTO_CACHE_TTL:-300}"
 [[ "$CACHE_TTL" =~ ^[0-9]+$ ]] || CACHE_TTL=300
 CACHE_BYPASS=0
+ALL_INCLUDED_FULL_VERIFIED=0
 
 cache_read() {
   local slot="$1"
@@ -528,6 +575,16 @@ cache_read() {
   local actual="available"
   awk -v u="$used" -v l="$limit" 'BEGIN { exit !(u >= l) }' && actual="full"
   [[ "$state" == "$actual" ]] || return 1
+  # A slot can be re-authenticated as a different Kiro account without
+  # changing its configuration. Bind cached usage to the currently logged-in
+  # identity so account switches refresh usage immediately instead of showing
+  # the previous account until the cache expires.
+  local current_email=""
+  current_email="$(slot_probe_cmd "$slot" whoami 2>/dev/null | tr -d '\r' | sed -n 's/^Email: //p' | head -n 1)"
+  if [[ -z "$current_email" || "${current_email,,}" != "${email,,}" ]]; then
+    rm -f "$file"
+    return 1
+  fi
   local pin="${SLOT_PIN[$slot]:--}"
   [[ "$pin" == "-" || "${email,,}" == "${pin,,}" ]] || return 1
   P_STATE[$slot]="$state"
@@ -564,6 +621,36 @@ cache_clear() {
   return 0
 }
 
+is_authorized_overage_email() {
+  case "${1,,}" in
+    kiro2@my-style.ai | taylorkim@my-style.ai) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Kiro's profile-wide overage cap is managed in the Kiro dashboard. Allow only
+# these explicitly approved identities, on their matching pinned slots, and
+# only after all included allocations are confirmed exhausted.
+authorize_account_overage() {
+  local slot="$1"
+  local account_email="${P_EMAIL[$slot],,}"
+  local pin="${SLOT_PIN[$slot],,}"
+  [[ -n "$account_email" && "$pin" != "-" && "$pin" == "$account_email" ]] ||
+    die 75 "overage slot $slot must be explicitly pinned to its logged-in account"
+  is_authorized_overage_email "$account_email" ||
+    die 75 "overages are not authorized for account $account_email"
+  if ((ALL_INCLUDED_FULL_VERIFIED == 0)); then
+    probe_all full "${SLOTS[@]}"
+    ALL_INCLUDED_FULL_VERIFIED=1
+  fi
+  local s=""
+  for s in "${SLOTS[@]}"; do
+    [[ "${P_STATE[$s]:-unknown}" == "full" ]] ||
+      die 69 "included Kiro credits remain or usage is unknown for $s; refusing any overage"
+  done
+  diag "All included Kiro allocations are exhausted; continuing under the Kiro profile's dashboard overage cap."
+}
+
 # Fill P_* from cache where fresh; probe only the rest (full mode).
 probe_all_cached() {
   local need=()
@@ -586,12 +673,12 @@ probe_all() {
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/kiro-auto.XXXXXX")" || die 73 "cannot create a temporary directory"
   # One overall deadline per probe wave. timeout signals the probe's whole
   # process group, so kiro-usage's trap also removes its tmux session.
-  local deadline="${KIRO_AUTO_PROBE_DEADLINE:-45}"
+  local deadline="${KIRO_AUTO_PROBE_DEADLINE:-60}"
   # Reuse detection results in the child probes (not exported further).
   local child_env=(env "KIRO_AUTO_SHIM=0")
   [[ -n "$WINDOWS_CLI" ]] && child_env+=("KIRO_AUTO_WINDOWS_CLI=$WINDOWS_CLI")
   [[ -n "$WSL_CLI" ]] && child_env+=("KIRO_AUTO_WSL_CLI=$WSL_CLI")
-  [[ "$deadline" =~ ^[1-9][0-9]*$ ]] || deadline=45
+  [[ "$deadline" =~ ^[1-9][0-9]*$ ]] || deadline=60
   local s=""
   for s in "$@"; do
     if [[ -n "$TIMEOUT_BIN" ]]; then
@@ -603,10 +690,19 @@ probe_all() {
   wait
   for s in "$@"; do
     if ! IFS=$'\t' read -r "P_STATE[$s]" "P_EMAIL[$s]" "P_USED[$s]" "P_LIMIT[$s]" <"$tmp/$s"; then
-      P_STATE[$s]="unknown"
-      P_EMAIL[$s]="-"
-      P_USED[$s]="-"
-      P_LIMIT[$s]="-"
+      # Keep identity visible if an outer timeout kills the usage probe before
+      # its final status line is written. Recheck with a cheap identity probe.
+      local identity=""
+      identity="$(probe_slot "$s" identity 2>/dev/null || true)"
+      if [[ -n "$identity" ]]; then
+        IFS=$'\t' read -r "P_STATE[$s]" "P_EMAIL[$s]" "P_USED[$s]" "P_LIMIT[$s]" <<<"$identity"
+        [[ "${P_STATE[$s]}" == "logged-in" ]] && P_STATE[$s]="unknown"
+      else
+        P_STATE[$s]="unknown"
+        P_EMAIL[$s]="-"
+        P_USED[$s]="-"
+        P_LIMIT[$s]="-"
+      fi
     fi
   done
   rm -rf "$tmp"
@@ -919,6 +1015,10 @@ run_chat() {
   local default_args=()
   local configure_model="${KIRO_AUTO_CONFIGURE_MODEL:-0}"
   # Raw `kiro-cli chat` calls routed through the shim keep their own flags.
+  # Default routed chats to V3 unless the caller explicitly selects an engine.
+  if [[ "$SUBCMD" == "chat" ]] && ! has_arg "--v2 --v3" "${PRE_ARGS[@]}" "$@"; then
+    default_args+=(--v3)
+  fi
   if [[ "${KIRO_AUTO_VIA_SHIM:-0}" != "1" && "$SUBCMD" == chat ]]; then
     if [[ -n "$DEFAULT_MODEL" && "$configure_model" != "1" ]] && ! has_arg "--model" "$@"; then
       default_args+=(--model "$DEFAULT_MODEL")
@@ -970,6 +1070,19 @@ run_chat() {
     cache_clear "$slot"
     die 78 "slot $slot account changed since it was checked (${expected} -> ${now}); run again"
   fi
+  # Confirm included usage before every model call that did not arrive with a
+  # fresh usage result. An explicitly pinned, approved account may use the
+  # profile-capped overage after every configured slot is confirmed exhausted.
+  if [[ "${P_USED[$slot]:--}" == "-" || "${P_LIMIT[$slot]:--}" == "-" ]]; then
+    local usage_probe=""
+    usage_probe="$(probe_slot "$slot" full)"
+    IFS=$'\t' read -r "P_STATE[$slot]" "P_EMAIL[$slot]" "P_USED[$slot]" "P_LIMIT[$slot]" <<<"$usage_probe"
+  fi
+  case "${P_STATE[$slot]:-unknown}" in
+    available) ;;
+    full) authorize_account_overage "$slot" ;;
+    *) die 69 "cannot verify included Kiro usage for $slot; refusing to risk an overage" ;;
+  esac
   # Informational for child processes; selector-only knobs must not leak into
   # nested `kiro`/`kiro-cli` calls made from inside this chat.
   export KIRO_AUTO_SLOT="$slot"
@@ -1249,7 +1362,35 @@ for s in "${order[@]}"; do
   [[ "${P_STATE[$s]}" == "full" ]] || all_full=0
 done
 if ((all_full)); then
-  diag "All Kiro slots are out of included credits."
+  # Cached Kiro usage may be up to five minutes old. Refresh Kiro allocations
+  # first; the Kiro dashboard controls the profile-wide overage cap.
+  probe_all full "${order[@]}"
+  chosen="$(auto_pick "${order[@]}" || true)"
+  if [[ -n "$chosen" ]]; then
+    diag "Kiro included credits refreshed; using: $(slot_summary "$chosen")"
+    run_chat "$chosen" "$@"
+  fi
+  all_full=1
+  for s in "${order[@]}"; do
+    [[ "${P_STATE[$s]}" == "full" ]] || all_full=0
+  done
+  ((all_full)) || {
+    diag "Could not freshly verify that all included Kiro allocations are exhausted; refusing overage."
+    exit 69
+  }
+  ALL_INCLUDED_FULL_VERIFIED=1
+  overage_slot=""
+  for s in "${order[@]}"; do
+    if [[ "${SLOT_PIN[$s],,}" == "${P_EMAIL[$s],,}" ]] && is_authorized_overage_email "${P_EMAIL[$s]:-}"; then
+      overage_slot="$s"
+      break
+    fi
+  done
+  if [[ -n "$overage_slot" ]]; then
+    diag "All included Kiro allocations are exhausted; using an explicitly pinned profile-overage slot."
+    run_chat "$overage_slot" "$@"
+  fi
+  diag "All Kiro slots are out of included credits; no authorized pinned overage slot was verified."
   exit 75
 fi
 diag "No verified Kiro slot with available credits could be selected safely (unknown usage is never guessed)."

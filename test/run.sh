@@ -214,6 +214,7 @@ cp "$root/bin/kiro-cli-shim" "$HOME/.local/share/kiro-auto/kiro-cli-shim"
 cat >"$HOME/.local/bin/kiro-cli-real" <<'EOF'
 #!/usr/bin/env bash
 if [[ "$1" == update ]]; then
+  printf '%s\n' "$(basename "$0")" >"$HOME/update_invoked_as"
   printf '#!/bin/sh\necho v2 "$@"\n' >"$HOME/.local/bin/kiro-cli"
   chmod 755 "$HOME/.local/bin/kiro-cli"
   exit 0
@@ -223,11 +224,13 @@ EOF
 chmod 755 "$HOME/.local/bin/kiro-cli-real"
 KIRO_AUTO_SHIM=1 "$HOME/.local/bin/kiro-cli" update </dev/null >/dev/null 2>&1; rc=$?
 check "update exit status kept" "0" "$rc"
+check "updater invoked under supported executable name" "kiro-cli" "$(cat "$HOME/update_invoked_as")"
 check "update: shim reinstalled" "kiro-auto-shim" "$(cat "$HOME/.local/bin/kiro-cli")"
 check "update: new binary is real" "v2" "$(cat "$HOME/.local/bin/kiro-cli-real")"
 check "update: old binary kept as .prev" "v1" "$(cat "$HOME/.local/bin/kiro-cli-real.prev")"
 cp "$work/fake-cli" "$HOME/.local/bin/kiro-cli-real"
 rm -f "$HOME/.local/share/kiro-auto/kiro-cli-shim"
+rm -f "$HOME/update_invoked_as"
 
 # --- whoami failures are probe-error, not "not logged in".
 touch "$HOME/.local/share/kiro-cli/fail"
@@ -405,7 +408,11 @@ check "fast path runs no /usage" "$calls1" "$(wc -l <"$HOME/usage.calls")"
 cached_run accounts --refresh >/dev/null
 check "--refresh re-checks" "yes" "$( (($(wc -l <"$HOME/usage.calls") > calls1)) && echo yes)"
 echo "b@example.com" >"$HOME/.local/share/kiro-cli/email"
-check "cached account change still refused before chat" "account changed" "$(cached_run chat --no-interactive -- hi)"
+out="$(cached_run accounts)"
+check "account switch refreshes cached identity" "b@example.com" "$out"
+check "account switch refreshes cached usage" "10/100" "$out"
+out="$(KIRO_AUTO_DRY_RUN=1 cached_run chat --no-interactive -- hi)"
+check "cached account switch starts chat on new identity" "b@example.com" "$out"
 echo "a@example.com" >"$HOME/.local/share/kiro-cli/email"
 KIRO_AUTO_WSL_CLI="$work/fake-cli" cached_run logout wsl >/dev/null
 check "logout clears that slot's cache" "gone" "$([[ -e "$HOME/.local/share/kiro-auto/cache/wsl" ]] || echo gone)"
@@ -562,6 +569,25 @@ printf 'DO-NOT-LOSE' >"$ih/.local/bin/kiro-cli"; chmod 600 "$ih/.local/bin/kiro-
 HOME="$ih" bash "$root/install.sh" --shim >/dev/null 2>&1; rc=$?
 check "install refuses non-executable kiro-cli" "1" "$rc"
 check "install keeps unexpected kiro-cli" "DO-NOT-LOSE" "$(cat "$ih/.local/bin/kiro-cli")"
+
+# --- Both approved accounts can use profile-capped overages only when their
+# slots are pinned and the included allocations for every slot are exhausted.
+printf 'wsl wsl - kiro2@my-style.ai\ntaylor wsl %s taylorkim@my-style.ai\n' "$HOME/.local/share/kiro-auto/slots/taylor" >"$KIRO_AUTO_CONFIG_DIR/slots"
+echo "kiro2@my-style.ai" >"$HOME/.local/share/kiro-cli/email"
+taylor="$HOME/.local/share/kiro-auto/slots/taylor/kiro-cli"
+mkdir -p "$taylor"
+echo "taylorkim@my-style.ai" >"$taylor/email"
+echo "100 100" >"$HOME/.local/share/kiro-cli/credits"
+echo "100 100" >"$taylor/credits"
+out="$(KIRO_AUTO_FORCE=wsl "$auto" chat --no-interactive -- hi </dev/null 2>&1)"; rc=$?
+check "forced full Kiro2 slot starts under profile overage cap" "Kiro account: kiro2@my-style.ai" "$out"
+check "Kiro2 overage reaches the fake CLI" "ANSWER" "$out"
+out="$(KIRO_AUTO_FORCE=taylor "$auto" chat --no-interactive -- hi </dev/null 2>&1)"; rc=$?
+check "forced full Taylor slot starts under profile overage cap" "Kiro account: taylorkim@my-style.ai" "$out"
+check "Taylor overage reaches the fake CLI" "ANSWER" "$out"
+out="$("$auto" chat --no-interactive -- hi </dev/null 2>&1)"; rc=$?
+check "automatic fallback chooses a pinned approved overage identity" "using an explicitly pinned profile-overage slot" "$out"
+check "automatic overage fallback reaches the fake CLI" "ANSWER" "$out"
 
 echo "$pass passed, $fail failed"
 ((fail == 0))

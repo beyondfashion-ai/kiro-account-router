@@ -66,6 +66,11 @@ email.
 
 - **Automatic selection**: slots are checked in parallel (`whoami` + `/usage`);
   the first slot in preference order with remaining credits is used.
+- **Profile-capped overages**: after a fresh check confirms every configured
+  slot has exhausted its included Kiro credits, overages may use only the
+  explicitly pinned `kiro2@my-style.ai` or `taylorkim@my-style.ai` slot. The
+  Kiro dashboard's profile-level overage cap controls paid usage; AWS credit
+  balances are not queried by this router.
 - **Interactive picker**: running `kiro-auto` in a terminal shows every slot
   with its account and credits. Press Enter (or wait 30 s) for the auto choice,
   or pick, log in, log out, or add an account right there.
@@ -199,6 +204,9 @@ second      wsl       /home/me/.local/share/kiro-auto/slots/second  -
 ```
 
 Set `pin_email` to an address to refuse any other account in that slot.
+Leave it as `-` (the default) when you re-authenticate that slot with different
+Kiro accounts. Cached usage is tied to the live `whoami` identity; changing the
+login invalidates the old usage result and triggers a fresh check automatically.
 
 | Variable | Effect |
 |---|---|
@@ -220,9 +228,16 @@ slot unavailable, `73`/`74` model lock or model setting failed.
 
 ## Safety checks
 
+- Cached usage is reused only while the slot's current `whoami` identity matches
+  the identity that produced it. A changed login invalidates the cache and gets
+  a fresh usage check before automatic selection.
 - Right before a chat starts, the slot's account is checked again; if it
-  changed since the usage check (a login/logout elsewhere), the chat is not
-  started (exit `78`).
+  changed during the usage check, the chat is not started (exit `78`).
+- Overage is allowed only for the explicitly approved account emails, each
+  pinned to its matching slot, after every configured slot is freshly confirmed
+  exhausted. The router does not query AWS credits; set and monitor the
+  profile-wide overage limit in the Kiro dashboard. Any profile-level cap can
+  apply to other users in that Kiro profile as well.
 - `install.sh` refuses to overwrite a same-named `kiro-auto` / `kiro-usage` /
   `kiro-delegate` that it did not install, and `uninstall.sh` removes only its
   own files (they carry a `Part of kiro-account-router` header).

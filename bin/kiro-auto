@@ -690,19 +690,12 @@ probe_all() {
   wait
   for s in "$@"; do
     if ! IFS=$'\t' read -r "P_STATE[$s]" "P_EMAIL[$s]" "P_USED[$s]" "P_LIMIT[$s]" <"$tmp/$s"; then
-      # Keep identity visible if an outer timeout kills the usage probe before
-      # its final status line is written. Recheck with a cheap identity probe.
-      local identity=""
-      identity="$(probe_slot "$s" identity 2>/dev/null || true)"
-      if [[ -n "$identity" ]]; then
-        IFS=$'\t' read -r "P_STATE[$s]" "P_EMAIL[$s]" "P_USED[$s]" "P_LIMIT[$s]" <<<"$identity"
-        [[ "${P_STATE[$s]}" == "logged-in" ]] && P_STATE[$s]="unknown"
-      else
-        P_STATE[$s]="unknown"
-        P_EMAIL[$s]="-"
-        P_USED[$s]="-"
-        P_LIMIT[$s]="-"
-      fi
+      # A missing probe result includes an outer timeout. Do not retry identity
+      # here: the CLI may be hung, and a second probe would exceed the deadline.
+      P_STATE[$s]="unknown"
+      P_EMAIL[$s]="-"
+      P_USED[$s]="-"
+      P_LIMIT[$s]="-"
     fi
   done
   rm -rf "$tmp"

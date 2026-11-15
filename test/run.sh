@@ -27,7 +27,7 @@ case "$1" in
     [[ -f "$data/fail" ]] && { echo "transport failed"; exit 42; }
     [[ -f "$data/hang" ]] && sleep 30
     if [[ -f "$data/email" ]]; then echo "Email: $(<"$data/email")"; else echo "Not logged in"; exit 1; fi ;;
-  --legacy-ui)
+  --legacy-ui|--v2)
     # Minimal TUI for the real kiro-usage helper.
     echo "ask a question or describe a task"
     read -r line
@@ -130,15 +130,15 @@ cp "$root/bin/kiro-cli-shim" "$HOME/.local/bin/kiro-cli"
 cp "$auto" "$HOME/.local/bin/kiro-auto"
 chmod 755 "$HOME/.local/bin/kiro-cli" "$HOME/.local/bin/kiro-auto"
 echo "1 100" >"$HOME/.local/share/kiro-cli/credits"
-check "shim routes chat" "Using: wsl" "$(KIRO_AUTO_DRY_RUN=1 "$HOME/.local/bin/kiro-cli" chat --model m -- hi </dev/null 2>&1)"
-check "shim keeps caller flags" "chat --model m -- hi" "$(KIRO_AUTO_DRY_RUN=1 "$HOME/.local/bin/kiro-cli" chat --model m -- hi </dev/null 2>&1)"
+check "shim routes chat" "Using: wsl" "$(KIRO_AUTO_DRY_RUN=1 "$HOME/.local/bin/kiro-cli" chat --v3 --model m -- hi </dev/null 2>&1)"
+check "shim keeps caller flags" "chat --v3 --model m -- hi" "$(KIRO_AUTO_DRY_RUN=1 "$HOME/.local/bin/kiro-cli" chat --v3 --model m -- hi </dev/null 2>&1)"
 check "shim routes option-first chat" "Using: wsl" "$(KIRO_AUTO_DRY_RUN=1 "$HOME/.local/bin/kiro-cli" --legacy-ui chat --model m </dev/null 2>&1)"
-check "option-first chat keeps global flag before chat" "kiro-cli-real --legacy-ui chat --model m" "$(KIRO_AUTO_DRY_RUN=1 "$HOME/.local/bin/kiro-cli" --legacy-ui chat --model m </dev/null 2>&1)"
+check "option-first chat keeps global flag before chat" "kiro-cli-real --legacy-ui chat --v3 --model m" "$(KIRO_AUTO_DRY_RUN=1 "$HOME/.local/bin/kiro-cli" --legacy-ui chat --model m </dev/null 2>&1)"
 for form in "--resume" "--agent x" ""; do
   # shellcheck disable=SC2086
   check "shim routes implicit chat: kiro-cli $form" "Using: wsl" "$(KIRO_AUTO_DRY_RUN=1 "$HOME/.local/bin/kiro-cli" $form </dev/null 2>&1)"
 done
-check "implicit chat becomes an explicit chat" "kiro-cli-real chat --resume" "$(KIRO_AUTO_DRY_RUN=1 "$HOME/.local/bin/kiro-cli" --resume </dev/null 2>&1)"
+check "implicit chat becomes an explicit chat" "kiro-cli-real chat --v3 --resume" "$(KIRO_AUTO_DRY_RUN=1 "$HOME/.local/bin/kiro-cli" --resume </dev/null 2>&1)"
 out="$(KIRO_AUTO_DRY_RUN=1 "$HOME/.local/bin/kiro-cli" acp 2>"$work/acp.err" </dev/null)"
 check "acp is routed and runs as acp" "kiro-cli-real acp" "$out"
 check "acp selector messages stay off stdout" "Using: wsl" "$(cat "$work/acp.err")"
